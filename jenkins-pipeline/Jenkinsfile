@@ -1,0 +1,161 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'JDK-17'
+        maven 'Maven-3.9'
+    }
+
+    environment {
+        APP_NAME        = 'java-demo-app'
+        ARTIFACT_ID     = 'java-demo-app'
+        // Credenciales Jenkins: tipo "Secret text" (usuario) y "SSH Username with private key"
+        DEPLOY_USER     = credentials('deploy-ssh-user')
+        DEPLOY_KEY      = credentials('deploy-ssh-key')
+        DEPLOY_HOST_DEV = 'dev.example.com'
+        DEPLOY_HOST_PRO = 'prod.example.com'
+        DEPLOY_PATH     = '/opt/apps/java-demo-app'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['none', 'dev', 'prod'],
+            description: 'Entorno de despliegue (none = solo build)'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Omitir ejecución de tests'
+        )
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                dir('java-app') {
+                    sh 'mvn -B clean compile -DskipTests'
+                }
+            }
+        }
+
+        stage('Test') {
+            when {
+                expression { return !params.SKIP_TESTS }
+            }
+            steps {
+                dir('java-app') {
+                    sh 'mvn -B test'
+                }
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true, testResults: 'java-app/target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                dir('java-app') {
+                    sh 'mvn -B package -DskipTests'
+                }
+                script {
+                    env.APP_VERSION = sh(
+                        script: "mvn -q -f java-app/pom.xml help:evaluate -Dexpression=project.version -DforceStdout",
+                        returnStdout: true
+                    ).trim()
+                    env.JAR_PATH = "java-app/target/${ARTIFACT_ID}-${env.APP_VERSION}.jar"
+                }
+                archiveArtifacts artifacts: "java-app/target/${ARTIFACT_ID}-*.jar", fingerprint: true
+            }
+        }
+
+        stage('Deploy to Dev') {
+            when {
+                allOf {
+                    expression { params.DEPLOY_ENV == 'dev' }
+                    anyOf {
+                        branch 'develop'
+                        branch 'main'
+                    }
+                }
+            }
+            steps {
+                script {
+                    deployApp(
+                        host: env.DEPLOY_HOST_DEV,
+                        jarPath: env.JAR_PATH,
+                        environment: 'dev'
+                    )
+                }
+            }
+        }
+
+        stage('Deploy to Prod') {
+            when {
+                allOf {
+                    expression { params.DEPLOY_ENV == 'prod' }
+                    branch 'main'
+                }
+            }
+            steps {
+                input message: '¿Confirmar despliegue a PRODUCCIÓN?', ok: 'Desplegar'
+                script {
+                    deployApp(
+                        host: env.DEPLOY_HOST_PRO,
+                        jarPath: env.JAR_PATH,
+                        environment: 'prod'
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline completado: ${APP_NAME} v${APP_VERSION} (${GIT_COMMIT_SHORT})"
+        }
+        failure {
+            echo "Pipeline falló en build #${BUILD_NUMBER}"
+        }
+        always {
+            cleanWs deleteDirs: true, patterns: [[pattern: 'java-app/target', type: 'INCLUDE']]
+        }
+    }
+}
+
+def deployApp(Map config) {
+    echo "Desplegando ${APP_NAME} en ${config.environment} -> ${config.host}"
+
+    sh """
+        chmod +x jenkins-pipeline/scripts/deploy.sh
+        jenkins-pipeline/scripts/deploy.sh \\
+            --host ${config.host} \\
+            --user ${DEPLOY_USER} \\
+            --key \${DEPLOY_KEY} \\
+            --jar ${config.jarPath} \\
+            --remote-path ${DEPLOY_PATH} \\
+            --app-name ${APP_NAME} \\
+            --env ${config.environment}
+    """
+}

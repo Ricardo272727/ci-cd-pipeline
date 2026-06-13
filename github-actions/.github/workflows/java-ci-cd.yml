@@ -1,0 +1,194 @@
+# Equivalente al Jenkinsfile en jenkins-pipeline/
+# Para activarlo en GitHub: copia este archivo a .github/workflows/ en la raiz del repo.
+name: Java CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        description: Entorno de despliegue (none = solo build)
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - dev
+          - prod
+      skip_tests:
+        description: Omitir ejecucion de tests
+        required: false
+        default: false
+        type: boolean
+
+env:
+  APP_NAME: java-demo-app
+  ARTIFACT_ID: java-demo-app
+  DEPLOY_HOST_DEV: dev.example.com
+  DEPLOY_HOST_PRO: prod.example.com
+  DEPLOY_PATH: /opt/apps/java-demo-app
+
+concurrency:
+  group: java-ci-cd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+jobs:
+  build-test-package:
+    name: Build, Test & Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      app_version: ${{ steps.version.outputs.version }}
+      jar_name: ${{ steps.version.outputs.jar_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
+
+      - name: Git commit short
+        id: git
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: java-app
+        run: mvn -B clean compile -DskipTests
+
+      - name: Test
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_tests != true }}
+        working-directory: java-app
+        run: mvn -B test
+
+      - name: Publish test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.skip_tests != true)
+        with:
+          files: java-app/target/surefire-reports/*.xml
+          check_name: Java Unit Tests
+
+      - name: Package
+        working-directory: java-app
+        run: mvn -B package -DskipTests
+
+      - name: Resolve artifact version
+        id: version
+        run: |
+          VERSION=$(mvn -q -f java-app/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "jar_name=${{ env.ARTIFACT_ID }}-${VERSION}.jar" >> "$GITHUB_OUTPUT"
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_ID }}
+          path: java-app/target/${{ env.ARTIFACT_ID }}-*.jar
+          retention-days: 20
+
+      - name: Pipeline summary
+        if: success()
+        run: |
+          echo "Pipeline completado: ${APP_NAME} v${{ steps.version.outputs.version }} (${{ steps.git.outputs.short }})"
+
+      - name: Pipeline failed
+        if: failure()
+        run: echo "Pipeline fallo en run #${{ github.run_number }}"
+
+  deploy-dev:
+    name: Deploy to Dev
+    needs: build-test-package
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy_env == 'dev' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-latest
+    environment: development
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_ID }}
+
+      - name: Write SSH key
+        run: |
+          printf '%s\n' "$DEPLOY_KEY" > "${RUNNER_TEMP}/deploy_key"
+          chmod 600 "${RUNNER_TEMP}/deploy_key"
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy to dev
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+        run: |
+          JAR_PATH=$(find "$GITHUB_WORKSPACE" -name "${{ env.ARTIFACT_ID }}-*.jar" -type f | head -1)
+          chmod +x github-actions/scripts/deploy.sh
+          github-actions/scripts/deploy.sh \
+            --host "${{ env.DEPLOY_HOST_DEV }}" \
+            --user "${DEPLOY_USER}" \
+            --key "${RUNNER_TEMP}/deploy_key" \
+            --jar "${JAR_PATH}" \
+            --remote-path "${{ env.DEPLOY_PATH }}" \
+            --app-name "${{ env.APP_NAME }}" \
+            --env dev
+
+  deploy-prod:
+    name: Deploy to Prod
+    needs: build-test-package
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy_env == 'prod' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_ID }}
+
+      - name: Write SSH key
+        run: |
+          printf '%s\n' "$DEPLOY_KEY" > "${RUNNER_TEMP}/deploy_key"
+          chmod 600 "${RUNNER_TEMP}/deploy_key"
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Deploy to prod
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_SSH_USER }}
+        run: |
+          JAR_PATH=$(find "$GITHUB_WORKSPACE" -name "${{ env.ARTIFACT_ID }}-*.jar" -type f | head -1)
+          chmod +x github-actions/scripts/deploy.sh
+          github-actions/scripts/deploy.sh \
+            --host "${{ env.DEPLOY_HOST_PRO }}" \
+            --user "${DEPLOY_USER}" \
+            --key "${RUNNER_TEMP}/deploy_key" \
+            --jar "${JAR_PATH}" \
+            --remote-path "${{ env.DEPLOY_PATH }}" \
+            --app-name "${{ env.APP_NAME }}" \
+            --env prod
