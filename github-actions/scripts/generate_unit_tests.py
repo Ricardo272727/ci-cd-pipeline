@@ -20,11 +20,12 @@ SYSTEM_PROMPT = """You are a senior Java engineer writing unit tests.
 Rules:
 - Use JUnit 5 (org.junit.jupiter.api) and Spring Boot Test when the class is a Spring component.
 - Use Mockito only when mocking is clearly needed.
-- Output ONLY the complete Java source for the test class — no markdown fences, no explanation.
+- Reply with the complete Java test class source in your message.
+- Do NOT use edit_file, write, or any other tools — paste the code directly in the response.
+- Do NOT add markdown fences or explanations before or after the code.
 - Match the package of the source file.
 - Name the test class {ClassName}Test.
 - Cover public methods with meaningful assertions, not only contextLoads().
-- Do not modify or reference files other than the requested test class.
 """
 
 
@@ -45,6 +46,55 @@ def strip_code_fences(text: str) -> str:
     if fenced:
         return fenced.group(1).strip()
     return text.strip()
+
+
+def looks_like_java_source(text: str) -> bool:
+    return "package " in text and "class " in text
+
+
+def extract_java_source(text: str) -> str | None:
+    candidates: list[str] = []
+
+    fenced = re.findall(r"```(?:java)?\s*\n(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    candidates.extend(fenced)
+
+    stripped = text.strip()
+    if stripped:
+        candidates.append(stripped)
+
+    for block in re.findall(
+        r"(package\s+[\w.]+;\s*(?:import\s+[\w.*]+;\s*)*.*?class\s+\w+.*)",
+        text,
+        re.DOTALL,
+    ):
+        candidates.append(block)
+
+    for candidate in candidates:
+        cleaned = candidate.strip()
+        if looks_like_java_source(cleaned):
+            return cleaned
+    return None
+
+
+def candidate_test_paths(source: Path, java_app_dir: Path) -> list[Path]:
+    rel = source.relative_to(java_app_dir / "src" / "main" / "java")
+    test_dir = java_app_dir / "src" / "test" / "java" / rel.parent
+    stem = rel.stem
+    return [
+        test_dir / f"{stem}Test.java",
+        test_dir / f"{stem}Tests.java",
+    ]
+
+
+def read_agent_written_test(paths: list[Path]) -> tuple[Path, str] | None:
+    for path in paths:
+        if not path.is_file():
+            continue
+        content = path.read_text(encoding="utf-8")
+        extracted = extract_java_source(content) or content
+        if looks_like_java_source(extracted):
+            return path, extracted
+    return None
 
 
 def build_user_prompt(
@@ -347,16 +397,26 @@ async def async_main(argv: list[str]) -> int:
                 exit_code = fail(f"failed to generate tests for {source}: {exc}", source=source)
                 break
 
-            test_code = strip_code_fences(raw)
-            if "class " not in test_code or "package " not in test_code:
-                print(raw[:500], file=sys.stderr)
-                exit_code = fail(
-                    f"model response for {source} does not look like Java source",
-                    source=source,
-                )
-                break
+            agent_written = False
+            test_code = extract_java_source(raw)
+            if not test_code:
+                written = read_agent_written_test(candidate_test_paths(source, java_app_dir))
+                if written:
+                    test_path, test_code = written
+                    agent_written = True
+                    print(f"Using test file written by Copilot agent: {test_path}")
+                else:
+                    print(raw[:1000], file=sys.stderr)
+                    exit_code = fail(
+                        f"model response for {source} does not look like Java source",
+                        source=source,
+                    )
+                    break
 
-            write_test_file(test_path, test_code, args.dry_run)
+            if not agent_written:
+                write_test_file(test_path, test_code, args.dry_run)
+            else:
+                print(f"Keeping agent-written file at {test_path}")
             summary["generated"].append(str(test_path.relative_to(repo_root)))
 
         summary["changed"] = len(summary["generated"]) > 0
