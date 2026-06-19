@@ -1,0 +1,77 @@
+name: SonarQube Scan
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: "17"
+  WORKING_DIRECTORY: java-app
+  SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY || 'java-demo-app' }}
+
+concurrency:
+  group: sonarqube-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Cache SonarQube packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Run tests and SonarQube scan
+        working-directory: ${{ env.WORKING_DIRECTORY }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+        run: |
+          MVN_ARGS=(
+            -B verify
+            org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
+            "-Dsonar.projectKey=${SONAR_PROJECT_KEY}"
+          )
+
+          if [ -n "${SONAR_ORGANIZATION}" ]; then
+            MVN_ARGS+=("-Dsonar.organization=${SONAR_ORGANIZATION}")
+          fi
+
+          mvn "${MVN_ARGS[@]}"
+
+      - name: Scan summary
+        if: always()
+        run: |
+          echo "SonarQube scan finished with status: ${{ job.status }}"
+          echo "Project key: ${SONAR_PROJECT_KEY}"
+          if [ -n "${{ vars.SONAR_ORGANIZATION }}" ]; then
+            echo "Organization: ${{ vars.SONAR_ORGANIZATION }}"
+          fi
+          echo "Review results in your SonarQube or SonarCloud dashboard."
