@@ -79,7 +79,7 @@ async def generate_with_copilot(
     *,
     token: str,
     working_directory: str,
-    model: str,
+    model: str | None,
     timeout_seconds: int,
 ) -> str:
     from copilot import CopilotClient
@@ -87,9 +87,12 @@ async def generate_with_copilot(
     from copilot.session_events import AssistantMessageData, SessionIdleData
 
     messages: list[str] = []
+    errors: list[str] = []
     done = asyncio.Event()
 
     def on_event(event) -> None:
+        if getattr(event, "type", "") in {"session.error", "error"}:
+            errors.append(str(getattr(event, "data", event)))
         match event.data:
             case AssistantMessageData() as data:
                 if data.content:
@@ -97,21 +100,34 @@ async def generate_with_copilot(
             case SessionIdleData():
                 done.set()
 
+    session_kwargs: dict = {
+        "on_permission_request": PermissionHandler.approve_all,
+        "infinite_sessions": {"enabled": False},
+    }
+    if model:
+        session_kwargs["model"] = model
+
     async with CopilotClient(
         github_token=token,
         working_directory=working_directory,
         use_logged_in_user=False,
     ) as client:
-        async with await client.create_session(
-            on_permission_request=PermissionHandler.approve_all,
-            model=model,
-            infinite_sessions={"enabled": False},
-        ) as session:
+        async with await client.create_session(**session_kwargs) as session:
             session.on(on_event)
             await session.send(f"{SYSTEM_PROMPT}\n\n{prompt}")
             await asyncio.wait_for(done.wait(), timeout=timeout_seconds)
 
-    return "\n".join(messages)
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+    response = "\n".join(messages).strip()
+    if not response:
+        raise RuntimeError(
+            "Copilot returned an empty response. "
+            "For personal repositories, set COPILOT_GITHUB_TOKEN to a fine-grained PAT "
+            "with Copilot Requests permission (GITHUB_TOKEN alone is usually not enough)."
+        )
+    return response
 
 
 def generate_with_openai(
@@ -146,12 +162,24 @@ def generate_with_openai(
     return content or ""
 
 
+def resolve_copilot_token() -> str | None:
+    """User PAT for Copilot; required for personal repos in GitHub Actions."""
+    return os.environ.get("COPILOT_GITHUB_TOKEN")
+
+
 def resolve_github_token() -> str | None:
     return (
-        os.environ.get("COPILOT_GITHUB_TOKEN")
+        resolve_copilot_token()
         or os.environ.get("GITHUB_TOKEN")
         or os.environ.get("GH_TOKEN")
     )
+
+
+def write_summary(summary_path: Path | None, summary: dict) -> None:
+    if not summary_path:
+        return
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 def write_test_file(test_path: Path, content: str, dry_run: bool) -> None:
@@ -211,14 +239,17 @@ def select_provider(requested: str) -> str:
     if requested != "auto":
         return requested
 
-    if resolve_github_token():
+    if resolve_copilot_token():
         return "copilot"
     if os.environ.get("OPENAI_API_KEY"):
         return "openai"
+    if os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"):
+        return "copilot"
 
     raise RuntimeError(
-        "No AI provider configured. Set GITHUB_TOKEN / COPILOT_GITHUB_TOKEN "
-        "(Copilot SDK) or OPENAI_API_KEY (OpenAI fallback)."
+        "No AI provider configured. Set COPILOT_GITHUB_TOKEN "
+        "(recommended for personal repos), OPENAI_API_KEY, or rely on org "
+        "Copilot billing via GITHUB_TOKEN with copilot-requests: write."
     )
 
 
@@ -226,100 +257,116 @@ async def async_main(argv: list[str]) -> int:
     args = parse_args(argv)
     repo_root = Path.cwd().resolve()
     java_app_dir = (repo_root / args.java_app_dir).resolve()
+    summary_path = Path(args.output_summary).resolve() if args.output_summary else None
+    summary: dict = {
+        "provider": None,
+        "generated": [],
+        "skipped": [],
+        "errors": [],
+        "changed": False,
+    }
+    exit_code = 0
 
-    if not java_app_dir.is_dir():
-        print(f"error: java-app directory not found: {java_app_dir}", file=sys.stderr)
+    def fail(message: str, *, source: Path | None = None) -> int:
+        entry = {"message": message}
+        if source is not None:
+            entry["source"] = str(source)
+        summary["errors"].append(entry)
+        print(f"error: {message}", file=sys.stderr)
         return 1
 
-    provider = select_provider(args.provider)
-    print(f"Using provider: {provider}")
+    try:
+        if not java_app_dir.is_dir():
+            return fail(f"java-app directory not found: {java_app_dir}")
 
-    if args.sources:
-        sources = []
-        for item in args.sources:
-            path = Path(item)
-            if not path.is_absolute():
-                path = repo_root / path
-            sources.append(path.resolve())
-    else:
-        sources = find_java_sources(java_app_dir)
+        provider = select_provider(args.provider)
+        summary["provider"] = provider
+        print(f"Using provider: {provider}")
 
-    pom_excerpt = read_pom_excerpt(java_app_dir)
-    generated: list[str] = []
-    skipped: list[str] = []
-
-    copilot_model = os.environ.get("COPILOT_MODEL", "gpt-4.1")
-    openai_model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
-    openai_base_url = os.environ.get("OPENAI_BASE_URL")
-
-    for source in sources:
-        if not source.is_file():
-            print(f"warning: skipping missing source {source}", file=sys.stderr)
-            continue
-
-        test_path = source_to_test_path(source, java_app_dir)
-        if test_path.exists() and not args.force:
-            print(f"Skipping {source.name}: test already exists at {test_path}")
-            skipped.append(str(test_path))
-            continue
-
-        source_code = source.read_text(encoding="utf-8")
-        prompt = build_user_prompt(source, source_code, test_path, pom_excerpt)
-
-        print(f"Generating tests for {source.relative_to(repo_root)} ...")
-
-        try:
-            if provider == "copilot":
-                token = resolve_github_token()
-                if not token:
-                    raise RuntimeError("GitHub token required for Copilot provider")
-                raw = await generate_with_copilot(
-                    prompt,
-                    token=token,
-                    working_directory=str(repo_root),
-                    model=copilot_model,
-                    timeout_seconds=args.timeout,
-                )
-            else:
-                api_key = os.environ.get("OPENAI_API_KEY")
-                if not api_key:
-                    raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider")
-                raw = generate_with_openai(
-                    prompt,
-                    api_key=api_key,
-                    model=openai_model,
-                    base_url=openai_base_url,
-                )
-        except Exception as exc:
-            print(f"error: failed to generate tests for {source}: {exc}", file=sys.stderr)
-            return 1
-
-        test_code = strip_code_fences(raw)
-        if "class " not in test_code or "package " not in test_code:
+        if provider == "copilot" and not resolve_copilot_token():
             print(
-                f"error: model response for {source} does not look like Java source",
+                "warning: COPILOT_GITHUB_TOKEN is not set; falling back to GITHUB_TOKEN. "
+                "Personal repositories usually need a user PAT with Copilot Requests.",
                 file=sys.stderr,
             )
-            print(raw[:500], file=sys.stderr)
-            return 1
 
-        write_test_file(test_path, test_code, args.dry_run)
-        generated.append(str(test_path.relative_to(repo_root)))
+        if args.sources:
+            sources = []
+            for item in args.sources:
+                path = Path(item)
+                if not path.is_absolute():
+                    path = repo_root / path
+                sources.append(path.resolve())
+        else:
+            sources = find_java_sources(java_app_dir)
 
-    summary = {
-        "provider": provider,
-        "generated": generated,
-        "skipped": skipped,
-        "changed": len(generated) > 0,
-    }
+        pom_excerpt = read_pom_excerpt(java_app_dir)
+        copilot_model = os.environ.get("COPILOT_MODEL", "").strip() or None
+        openai_model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+        openai_base_url = os.environ.get("OPENAI_BASE_URL")
 
-    if args.output_summary:
-        summary_path = Path(args.output_summary)
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        for source in sources:
+            if not source.is_file():
+                print(f"warning: skipping missing source {source}", file=sys.stderr)
+                continue
 
-    print(json.dumps(summary))
-    return 0
+            test_path = source_to_test_path(source, java_app_dir)
+            if test_path.exists() and not args.force:
+                print(f"Skipping {source.name}: test already exists at {test_path}")
+                summary["skipped"].append(str(test_path.relative_to(repo_root)))
+                continue
+
+            source_code = source.read_text(encoding="utf-8")
+            prompt = build_user_prompt(source, source_code, test_path, pom_excerpt)
+
+            print(f"Generating tests for {source.relative_to(repo_root)} ...")
+
+            try:
+                if provider == "copilot":
+                    token = resolve_github_token()
+                    if not token:
+                        raise RuntimeError("GitHub token required for Copilot provider")
+                    raw = await generate_with_copilot(
+                        prompt,
+                        token=token,
+                        working_directory=str(repo_root),
+                        model=copilot_model,
+                        timeout_seconds=args.timeout,
+                    )
+                else:
+                    api_key = os.environ.get("OPENAI_API_KEY")
+                    if not api_key:
+                        raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider")
+                    raw = generate_with_openai(
+                        prompt,
+                        api_key=api_key,
+                        model=openai_model,
+                        base_url=openai_base_url,
+                    )
+            except Exception as exc:
+                exit_code = fail(f"failed to generate tests for {source}: {exc}", source=source)
+                break
+
+            test_code = strip_code_fences(raw)
+            if "class " not in test_code or "package " not in test_code:
+                print(raw[:500], file=sys.stderr)
+                exit_code = fail(
+                    f"model response for {source} does not look like Java source",
+                    source=source,
+                )
+                break
+
+            write_test_file(test_path, test_code, args.dry_run)
+            summary["generated"].append(str(test_path.relative_to(repo_root)))
+
+        summary["changed"] = len(summary["generated"]) > 0
+    except Exception as exc:
+        exit_code = fail(str(exc))
+    finally:
+        write_summary(summary_path, summary)
+        print(json.dumps(summary))
+
+    return exit_code
 
 
 def main() -> None:
