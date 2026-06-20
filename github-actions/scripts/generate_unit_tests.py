@@ -31,6 +31,11 @@ Rules:
 - Java records: accessor methods use the exact field names (e.g. cruiseFuelLiters(), not cruiseFuel()).
 - Java enums: use enum constants (Airport.JFK), never instantiate enums with new.
 - Use only APIs that exist in the API reference section. Do not invent enum constants, method names, or fields.
+- For double/float assertions always use assertEquals(expected, actual, delta) with delta >= 0.02.
+- Never hard-code expected double literals for computed distances or fuel values.
+- Do not reimplement production rounding in tests. The service may round intermediate values differently.
+- Prefer behavioral assertions: assertTrue(value > 0), assertEquals(ratio, actual/expected, 0.02), or verify exceptions/structure.
+- For Spring @Service classes, prefer @ExtendWith(MockitoExtension.class) unit tests without @SpringBootTest unless integration behavior is required.
 """
 
 
@@ -177,6 +182,12 @@ def describe_type_api(java_path: Path) -> str:
         lines.append("  public methods:")
         lines.extend(f"    - {method}" for method in methods)
 
+    if "round(" in content and "Math.round" in content:
+        lines.append(
+            "  note: numeric results are rounded to 2 decimals in production; "
+            "use assertEquals(expected, actual, 0.02) in tests"
+        )
+
     return "\n".join(lines)
 
 
@@ -227,16 +238,16 @@ def build_user_prompt(
     api_reference: str,
     dependency_context: str,
     *,
-    compile_errors: str | None = None,
+    fix_errors: str | None = None,
     current_test: str | None = None,
 ) -> str:
     fix_section = ""
-    if compile_errors and current_test:
+    if fix_errors and current_test:
         fix_section = f"""
-The previous test file does not compile. Fix it and return the full corrected Java source.
+The previous test file failed Maven verification. Fix it and return the full corrected Java source.
 
-Maven compilation errors:
-{compile_errors}
+Maven errors:
+{fix_errors}
 
 Broken test file:
 {current_test}
@@ -286,6 +297,23 @@ def verify_test_compile(java_app_dir: Path) -> tuple[bool, str]:
 
     result = subprocess.run(
         [mvn, "-B", "test-compile", "-f", str(pom)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    return result.returncode == 0, output
+
+
+def verify_tests(java_app_dir: Path) -> tuple[bool, str]:
+    pom = java_app_dir / "pom.xml"
+    try:
+        mvn = resolve_maven_executable()
+    except FileNotFoundError as exc:
+        return False, str(exc)
+
+    result = subprocess.run(
+        [mvn, "-B", "test", "-f", str(pom)],
         capture_output=True,
         text=True,
         check=False,
@@ -470,7 +498,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--max-retries",
         type=int,
         default=2,
-        help="Retries after Maven compile failures (default: 2)",
+        help="Retries after Maven compile/test failures (default: 2)",
+    )
+    parser.add_argument(
+        "--verify-tests",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run mvn test after compile verification (default: enabled)",
     )
     return parser.parse_args(argv)
 
@@ -616,7 +650,7 @@ async def async_main(argv: list[str]) -> int:
             print(f"Generating tests for {source.relative_to(repo_root)} ...")
             print(f"Included {len(dependency_sources)} dependency source(s) in prompt")
 
-            compile_errors: str | None = None
+            fix_errors: str | None = None
             current_test: str | None = None
             agent_written = False
             test_code = ""
@@ -625,7 +659,7 @@ async def async_main(argv: list[str]) -> int:
 
             for attempt in range(args.max_retries + 1):
                 if attempt > 0:
-                    print(f"Retrying generation after compile errors (attempt {attempt + 1})...")
+                    print(f"Retrying generation after Maven errors (attempt {attempt + 1})...")
 
                 prompt = build_user_prompt(
                     source,
@@ -634,7 +668,7 @@ async def async_main(argv: list[str]) -> int:
                     pom_excerpt,
                     api_reference,
                     dependency_context,
-                    compile_errors=compile_errors,
+                    fix_errors=fix_errors,
                     current_test=current_test,
                 )
 
@@ -676,21 +710,38 @@ async def async_main(argv: list[str]) -> int:
 
                 print("Verifying generated tests compile...")
                 compile_ok, compile_output = verify_test_compile(java_app_dir)
-                if compile_ok:
-                    break
+                if not compile_ok:
+                    fix_errors = compile_output[-4000:]
+                    current_test = test_code
+                    if attempt >= args.max_retries:
+                        print(compile_output[-4000:], file=sys.stderr)
+                        exit_code = fail(
+                            f"generated tests do not compile for {source} after "
+                            f"{args.max_retries + 1} attempt(s).",
+                            source=source,
+                        )
+                        summary["compile_errors"] = fix_errors
+                        source_failed = True
+                    continue
 
-                compile_errors = compile_output[-4000:]
-                current_test = test_code
-                if attempt >= args.max_retries:
-                    print(compile_output[-4000:], file=sys.stderr)
-                    exit_code = fail(
-                        f"generated tests do not compile for {source} after "
-                        f"{args.max_retries + 1} attempt(s).",
-                        source=source,
-                    )
-                    summary["compile_errors"] = compile_errors
-                    source_failed = True
-                    break
+                if args.verify_tests:
+                    print("Running generated tests...")
+                    tests_ok, test_output = verify_tests(java_app_dir)
+                    if not tests_ok:
+                        fix_errors = test_output[-4000:]
+                        current_test = test_code
+                        if attempt >= args.max_retries:
+                            print(test_output[-4000:], file=sys.stderr)
+                            exit_code = fail(
+                                f"generated tests fail for {source} after "
+                                f"{args.max_retries + 1} attempt(s).",
+                                source=source,
+                            )
+                            summary["test_errors"] = fix_errors
+                            source_failed = True
+                        continue
+
+                break
 
             if source_failed:
                 break
