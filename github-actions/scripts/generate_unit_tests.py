@@ -30,7 +30,7 @@ Rules:
 - Cover public methods with meaningful assertions, not only contextLoads().
 - Java records: accessor methods use the exact field names (e.g. cruiseFuelLiters(), not cruiseFuel()).
 - Java enums: use enum constants (Airport.JFK), never instantiate enums with new.
-- Use only APIs that exist in the related types provided in the prompt.
+- Use only APIs that exist in the API reference section. Do not invent enum constants, method names, or fields.
 """
 
 
@@ -102,13 +102,121 @@ def read_agent_written_test(paths: list[Path]) -> tuple[Path, str] | None:
     return None
 
 
-def gather_package_context(source: Path) -> str:
-    blocks: list[str] = []
-    for related in sorted(source.parent.glob("*.java")):
-        if related == source:
+def extract_enum_constants(java_source: str, type_name: str) -> list[str]:
+    enum_block = re.search(
+        rf"(?:public\s+)?enum\s+{re.escape(type_name)}\s*\{{(.*?)^\}}",
+        java_source,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not enum_block:
+        return []
+    constant_section = enum_block.group(1).split(";")[0]
+    constants: list[str] = []
+    for line in constant_section.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//"):
             continue
-        blocks.append(f"--- {related.name} ---\n{related.read_text(encoding='utf-8')}")
-    return "\n\n".join(blocks) if blocks else "(no other types in this package)"
+        if stripped.startswith(("private", "public", "protected", "@", "}", ",")):
+            continue
+        match = re.match(r"(\w+)\s*\(", stripped)
+        if match and match.group(1) != type_name:
+            constants.append(match.group(1))
+    return constants
+
+
+def extract_record_accessors(java_source: str, type_name: str) -> list[str]:
+    match = re.search(
+        rf"record\s+{re.escape(type_name)}\s*\((.*?)\)",
+        java_source,
+        re.DOTALL,
+    )
+    if not match:
+        return []
+    fields: list[str] = []
+    for part in match.group(1).split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        fields.append(cleaned.split()[-1])
+    return [f"{field}()" for field in fields]
+
+
+def extract_public_methods(java_source: str, type_name: str) -> list[str]:
+    if not re.search(rf"\b(?:class|@Service)\b", java_source) or type_name not in java_source:
+        pass
+    methods: list[str] = []
+    for match in re.finditer(
+        r"public\s+(?!class|static\s+class|enum|record|interface)([\w<>,\s\[\]?]+)\s+(\w+)\s*\(",
+        java_source,
+    ):
+        return_type = " ".join(match.group(1).split())
+        name = match.group(2)
+        if name == type_name:
+            continue
+        methods.append(f"{return_type} {name}(...)")
+    return methods
+
+
+def describe_type_api(java_path: Path) -> str:
+    content = java_path.read_text(encoding="utf-8")
+    type_name = java_path.stem
+    lines = [f"{type_name} ({java_path.as_posix()}):"]
+
+    if re.search(rf"\benum\s+{re.escape(type_name)}\b", content):
+        constants = extract_enum_constants(content, type_name)
+        if constants:
+            lines.append(f"  enum constants: {', '.join(constants)}")
+        lines.append("  usage: Airport.JFK (never invent constants like MIA if not listed)")
+
+    accessors = extract_record_accessors(content, type_name)
+    if accessors:
+        lines.append(f"  record accessors: {', '.join(accessors)}")
+
+    methods = extract_public_methods(content, type_name)
+    if methods:
+        lines.append("  public methods:")
+        lines.extend(f"    - {method}" for method in methods)
+
+    return "\n".join(lines)
+
+
+def gather_dependency_sources(source: Path, java_app_dir: Path) -> list[Path]:
+    main_root = java_app_dir / "src" / "main" / "java"
+    deps: dict[Path, None] = {}
+
+    for related in source.parent.glob("*.java"):
+        if related != source:
+            deps[related.resolve()] = None
+
+    source_content = source.read_text(encoding="utf-8")
+    source_package = ".".join(source.relative_to(main_root).parent.parts)
+
+    for imported in re.findall(r"^import\s+(?:static\s+)?([\w.]+);", source_content, re.MULTILINE):
+        if imported.startswith(("java.", "javax.", "jakarta.", "org.junit", "org.springframework")):
+            continue
+        candidate = main_root / Path(imported.replace(".", "/") + ".java")
+        if candidate.is_file():
+            deps[candidate.resolve()] = None
+
+    for simple_name in re.findall(r"\b([A-Z][A-Za-z0-9_]*)\b", source_content):
+        candidate = source.parent / f"{simple_name}.java"
+        if candidate.is_file() and candidate.resolve() != source.resolve():
+            deps[candidate.resolve()] = None
+
+    return sorted(deps.keys())
+
+
+def build_api_reference(dependency_sources: list[Path]) -> str:
+    if not dependency_sources:
+        return "(no project dependencies detected)"
+    return "\n\n".join(describe_type_api(path) for path in dependency_sources)
+
+
+def gather_dependency_context(dependency_sources: list[Path]) -> str:
+    blocks: list[str] = []
+    for path in dependency_sources:
+        blocks.append(f"--- {path.name} ---\n{path.read_text(encoding='utf-8')}")
+    return "\n\n".join(blocks) if blocks else "(no dependency sources)"
 
 
 def build_user_prompt(
@@ -116,8 +224,24 @@ def build_user_prompt(
     source_code: str,
     test_path: Path,
     pom_excerpt: str,
-    package_context: str,
+    api_reference: str,
+    dependency_context: str,
+    *,
+    compile_errors: str | None = None,
+    current_test: str | None = None,
 ) -> str:
+    fix_section = ""
+    if compile_errors and current_test:
+        fix_section = f"""
+The previous test file does not compile. Fix it and return the full corrected Java source.
+
+Maven compilation errors:
+{compile_errors}
+
+Broken test file:
+{current_test}
+"""
+
     return f"""Generate a JUnit 5 unit test file for the Java class below.
 
 Source file: {source_path.as_posix()}
@@ -126,9 +250,12 @@ Target test file: {test_path.as_posix()}
 Project context (pom.xml excerpt):
 {pom_excerpt}
 
-Related types in the same package (use exact method and field names from these sources):
-{package_context}
+API reference (use ONLY these symbols; do not invent enum values or method names):
+{api_reference}
 
+Dependency source files:
+{dependency_context}
+{fix_section}
 Class under test:
 {source_code}
 """
@@ -339,6 +466,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=True,
         help="Run mvn test-compile after generating tests (default: enabled)",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=2,
+        help="Retries after Maven compile failures (default: 2)",
+    )
     return parser.parse_args(argv)
 
 
@@ -358,6 +491,58 @@ def select_provider(requested: str) -> str:
         "(recommended for personal repos), OPENAI_API_KEY, or rely on org "
         "Copilot billing via GITHUB_TOKEN with copilot-requests: write."
     )
+
+
+async def request_generated_source(
+    prompt: str,
+    *,
+    provider: str,
+    repo_root: Path,
+    copilot_model: str | None,
+    openai_model: str,
+    openai_base_url: str | None,
+    timeout_seconds: int,
+) -> str:
+    if provider == "copilot":
+        token = resolve_github_token()
+        if not token:
+            raise RuntimeError("GitHub token required for Copilot provider")
+        return await generate_with_copilot(
+            prompt,
+            token=token,
+            working_directory=str(repo_root),
+            model=copilot_model,
+            timeout_seconds=timeout_seconds,
+        )
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider")
+    return generate_with_openai(
+        prompt,
+        api_key=api_key,
+        model=openai_model,
+        base_url=openai_base_url,
+    )
+
+
+def resolve_generated_test(
+    raw: str,
+    source: Path,
+    java_app_dir: Path,
+    test_path: Path,
+) -> tuple[Path, str, bool]:
+    test_code = extract_java_source(raw)
+    if test_code:
+        return test_path, test_code, False
+
+    written = read_agent_written_test(candidate_test_paths(source, java_app_dir))
+    if written:
+        path, code = written
+        print(f"Using test file written by Copilot agent: {path}")
+        return path, code, True
+
+    raise ValueError("model response does not look like Java source")
 
 
 async def async_main(argv: list[str]) -> int:
@@ -424,73 +609,91 @@ async def async_main(argv: list[str]) -> int:
                 continue
 
             source_code = source.read_text(encoding="utf-8")
-            package_context = gather_package_context(source)
-            prompt = build_user_prompt(
-                source, source_code, test_path, pom_excerpt, package_context
-            )
+            dependency_sources = gather_dependency_sources(source, java_app_dir)
+            api_reference = build_api_reference(dependency_sources)
+            dependency_context = gather_dependency_context(dependency_sources)
 
             print(f"Generating tests for {source.relative_to(repo_root)} ...")
+            print(f"Included {len(dependency_sources)} dependency source(s) in prompt")
 
-            try:
-                if provider == "copilot":
-                    token = resolve_github_token()
-                    if not token:
-                        raise RuntimeError("GitHub token required for Copilot provider")
-                    raw = await generate_with_copilot(
+            compile_errors: str | None = None
+            current_test: str | None = None
+            agent_written = False
+            test_code = ""
+
+            source_failed = False
+
+            for attempt in range(args.max_retries + 1):
+                if attempt > 0:
+                    print(f"Retrying generation after compile errors (attempt {attempt + 1})...")
+
+                prompt = build_user_prompt(
+                    source,
+                    source_code,
+                    test_path,
+                    pom_excerpt,
+                    api_reference,
+                    dependency_context,
+                    compile_errors=compile_errors,
+                    current_test=current_test,
+                )
+
+                raw = ""
+                try:
+                    raw = await request_generated_source(
                         prompt,
-                        token=token,
-                        working_directory=str(repo_root),
-                        model=copilot_model,
+                        provider=provider,
+                        repo_root=repo_root,
+                        copilot_model=copilot_model,
+                        openai_model=openai_model,
+                        openai_base_url=openai_base_url,
                         timeout_seconds=args.timeout,
                     )
-                else:
-                    api_key = os.environ.get("OPENAI_API_KEY")
-                    if not api_key:
-                        raise RuntimeError("OPENAI_API_KEY is required for OpenAI provider")
-                    raw = generate_with_openai(
-                        prompt,
-                        api_key=api_key,
-                        model=openai_model,
-                        base_url=openai_base_url,
+                    test_path, test_code, agent_written = resolve_generated_test(
+                        raw, source, java_app_dir, test_path
                     )
-            except Exception as exc:
-                exit_code = fail(f"failed to generate tests for {source}: {exc}", source=source)
-                break
-
-            agent_written = False
-            test_code = extract_java_source(raw)
-            if not test_code:
-                written = read_agent_written_test(candidate_test_paths(source, java_app_dir))
-                if written:
-                    test_path, test_code = written
-                    agent_written = True
-                    print(f"Using test file written by Copilot agent: {test_path}")
-                else:
-                    print(raw[:1000], file=sys.stderr)
+                except ValueError:
+                    if raw:
+                        print(raw[:1000], file=sys.stderr)
                     exit_code = fail(
                         f"model response for {source} does not look like Java source",
                         source=source,
                     )
+                    source_failed = True
+                    break
+                except Exception as exc:
+                    exit_code = fail(f"failed to generate tests for {source}: {exc}", source=source)
+                    source_failed = True
                     break
 
-            if not agent_written:
-                write_test_file(test_path, test_code, args.dry_run)
-            else:
-                print(f"Keeping agent-written file at {test_path}")
+                if not agent_written:
+                    write_test_file(test_path, test_code, args.dry_run)
+                else:
+                    print(f"Keeping agent-written file at {test_path}")
 
-            if args.verify_compile and not args.dry_run:
+                if not args.verify_compile or args.dry_run:
+                    break
+
                 print("Verifying generated tests compile...")
                 compile_ok, compile_output = verify_test_compile(java_app_dir)
-                if not compile_ok:
+                if compile_ok:
+                    break
+
+                compile_errors = compile_output[-4000:]
+                current_test = test_code
+                if attempt >= args.max_retries:
                     print(compile_output[-4000:], file=sys.stderr)
                     exit_code = fail(
-                        f"generated tests do not compile for {source}. "
-                        "Run locally with: python github-actions/scripts/generate_unit_tests.py "
-                        f"--source {source.relative_to(repo_root)} && mvn -f java-app test-compile",
+                        f"generated tests do not compile for {source} after "
+                        f"{args.max_retries + 1} attempt(s).",
                         source=source,
                     )
-                    summary["compile_errors"] = compile_output[-4000:]
+                    summary["compile_errors"] = compile_errors
+                    source_failed = True
                     break
+
+            if source_failed:
+                break
 
             summary["generated"].append(str(test_path.relative_to(repo_root)))
 
