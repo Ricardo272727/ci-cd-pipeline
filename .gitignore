@@ -50,3 +50,4 @@ Desktop.ini
 coverage/
 *.exec
 jacoco.exec
+.env.local

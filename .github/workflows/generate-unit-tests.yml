@@ -31,7 +31,7 @@ on:
         default: true
         type: boolean
   push:
-    branches: [main, develop]
+    branches: [main]
     paths:
       - "java-app/src/main/java/**"
       - "github-actions/scripts/generate_unit_tests.py"
@@ -74,15 +74,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r github-actions/requirements-generate-tests.txt
 
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
       - name: Generate unit tests
         id: generate
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          COPILOT_MODEL: ${{ vars.COPILOT_MODEL || 'gpt-4.1' }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
         run: |
+          set -euo pipefail
+
           FORCE_FLAG=""
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
             FORCE_FLAG="--force"
@@ -90,27 +99,34 @@ jobs:
 
           PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
 
+          set +o pipefail
           python github-actions/scripts/generate_unit_tests.py \
             --java-app-dir "${JAVA_APP_DIR}" \
             --provider "${PROVIDER}" \
+            --verify-compile \
             --output-summary "${RUNNER_TEMP}/generation-summary.json" \
             ${FORCE_FLAG} | tee "${RUNNER_TEMP}/generation.log"
+          SCRIPT_EXIT=${PIPESTATUS[0]}
+          set -o pipefail
+
+          if [ ! -f "${RUNNER_TEMP}/generation-summary.json" ]; then
+            echo "error: generation summary was not written"
+            exit "${SCRIPT_EXIT:-1}"
+          fi
+
+          if [ "${SCRIPT_EXIT}" -ne 0 ]; then
+            echo "error: test generation failed with exit code ${SCRIPT_EXIT}"
+            cat "${RUNNER_TEMP}/generation-summary.json"
+            exit "${SCRIPT_EXIT}"
+          fi
 
           CHANGED=$(python -c "import json; print('true' if json.load(open('${RUNNER_TEMP}/generation-summary.json'))['changed'] else 'false')")
           echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify generated tests compile
-        if: steps.generate.outputs.changed == 'true'
-        uses: actions/setup-java@v4
-        with:
-          java-version: "17"
-          distribution: temurin
-          cache: maven
-
       - name: Run Maven test compile
         if: steps.generate.outputs.changed == 'true'
         working-directory: ${{ env.JAVA_APP_DIR }}
-        run: mvn -B test-compile
+        run: mvn -B test
 
       - name: Create pull request
         if: >-
