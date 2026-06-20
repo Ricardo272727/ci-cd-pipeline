@@ -12,6 +12,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +28,9 @@ Rules:
 - Match the package of the source file.
 - Name the test class {ClassName}Test.
 - Cover public methods with meaningful assertions, not only contextLoads().
+- Java records: accessor methods use the exact field names (e.g. cruiseFuelLiters(), not cruiseFuel()).
+- Java enums: use enum constants (Airport.JFK), never instantiate enums with new.
+- Use only APIs that exist in the related types provided in the prompt.
 """
 
 
@@ -97,11 +102,21 @@ def read_agent_written_test(paths: list[Path]) -> tuple[Path, str] | None:
     return None
 
 
+def gather_package_context(source: Path) -> str:
+    blocks: list[str] = []
+    for related in sorted(source.parent.glob("*.java")):
+        if related == source:
+            continue
+        blocks.append(f"--- {related.name} ---\n{related.read_text(encoding='utf-8')}")
+    return "\n\n".join(blocks) if blocks else "(no other types in this package)"
+
+
 def build_user_prompt(
     source_path: Path,
     source_code: str,
     test_path: Path,
     pom_excerpt: str,
+    package_context: str,
 ) -> str:
     return f"""Generate a JUnit 5 unit test file for the Java class below.
 
@@ -111,9 +126,45 @@ Target test file: {test_path.as_posix()}
 Project context (pom.xml excerpt):
 {pom_excerpt}
 
-Source code:
+Related types in the same package (use exact method and field names from these sources):
+{package_context}
+
+Class under test:
 {source_code}
 """
+
+
+def resolve_maven_executable() -> str:
+    override = os.environ.get("MVN_CMD") or os.environ.get("MAVEN_CMD")
+    if override:
+        return override
+
+    for candidate in ("mvn", "mvn.cmd", "mvn.bat"):
+        found = shutil.which(candidate)
+        if found:
+            return found
+
+    raise FileNotFoundError(
+        "Maven (mvn) not found in PATH. Install Maven, add it to PATH, "
+        "set MVN_CMD to the full executable path, or use --no-verify-compile."
+    )
+
+
+def verify_test_compile(java_app_dir: Path) -> tuple[bool, str]:
+    pom = java_app_dir / "pom.xml"
+    try:
+        mvn = resolve_maven_executable()
+    except FileNotFoundError as exc:
+        return False, str(exc)
+
+    result = subprocess.run(
+        [mvn, "-B", "test-compile", "-f", str(pom)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    return result.returncode == 0, output
 
 
 def read_pom_excerpt(java_app_dir: Path, max_chars: int = 2000) -> str:
@@ -282,6 +333,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--output-summary",
         help="Write a JSON summary of generated files to this path",
     )
+    parser.add_argument(
+        "--verify-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run mvn test-compile after generating tests (default: enabled)",
+    )
     return parser.parse_args(argv)
 
 
@@ -367,7 +424,10 @@ async def async_main(argv: list[str]) -> int:
                 continue
 
             source_code = source.read_text(encoding="utf-8")
-            prompt = build_user_prompt(source, source_code, test_path, pom_excerpt)
+            package_context = gather_package_context(source)
+            prompt = build_user_prompt(
+                source, source_code, test_path, pom_excerpt, package_context
+            )
 
             print(f"Generating tests for {source.relative_to(repo_root)} ...")
 
@@ -417,6 +477,21 @@ async def async_main(argv: list[str]) -> int:
                 write_test_file(test_path, test_code, args.dry_run)
             else:
                 print(f"Keeping agent-written file at {test_path}")
+
+            if args.verify_compile and not args.dry_run:
+                print("Verifying generated tests compile...")
+                compile_ok, compile_output = verify_test_compile(java_app_dir)
+                if not compile_ok:
+                    print(compile_output[-4000:], file=sys.stderr)
+                    exit_code = fail(
+                        f"generated tests do not compile for {source}. "
+                        "Run locally with: python github-actions/scripts/generate_unit_tests.py "
+                        f"--source {source.relative_to(repo_root)} && mvn -f java-app test-compile",
+                        source=source,
+                    )
+                    summary["compile_errors"] = compile_output[-4000:]
+                    break
+
             summary["generated"].append(str(test_path.relative_to(repo_root)))
 
         summary["changed"] = len(summary["generated"]) > 0

@@ -74,6 +74,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r github-actions/requirements-generate-tests.txt
 
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: maven
+
       - name: Generate unit tests
         id: generate
         env:
@@ -96,6 +103,7 @@ jobs:
           python github-actions/scripts/generate_unit_tests.py \
             --java-app-dir "${JAVA_APP_DIR}" \
             --provider "${PROVIDER}" \
+            --verify-compile \
             --output-summary "${RUNNER_TEMP}/generation-summary.json" \
             ${FORCE_FLAG} | tee "${RUNNER_TEMP}/generation.log"
           SCRIPT_EXIT=${PIPESTATUS[0]}
@@ -115,18 +123,10 @@ jobs:
           CHANGED=$(python -c "import json; print('true' if json.load(open('${RUNNER_TEMP}/generation-summary.json'))['changed'] else 'false')")
           echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
 
-      - name: Verify generated tests compile
-        if: steps.generate.outputs.changed == 'true'
-        uses: actions/setup-java@v4
-        with:
-          java-version: "17"
-          distribution: temurin
-          cache: maven
-
       - name: Run Maven test compile
         if: steps.generate.outputs.changed == 'true'
         working-directory: ${{ env.JAVA_APP_DIR }}
-        run: mvn -B test-compile
+        run: mvn -B test
 
       - name: Create pull request
         if: >-
