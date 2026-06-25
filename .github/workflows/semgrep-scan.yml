@@ -24,6 +24,11 @@ on:
           - auto
           - copilot
           - openai
+      create_pr:
+        description: Open a pull request with automated security fixes
+        required: true
+        default: true
+        type: boolean
   push:
     branches: [main]
     paths:
@@ -166,6 +171,10 @@ jobs:
     needs: semgrep-scan
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+      copilot-requests: write
 
     steps:
       - name: Checkout repository
@@ -189,7 +198,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r github-actions/requirements-generate-tests.txt
 
-      - name: Analyze findings with Copilot
+      - name: Analyze findings and apply fixes
         id: analyze
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -197,28 +206,36 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          INPUT_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}
+          SEMGREP_FINDING_COUNT: ${{ needs.semgrep-scan.outputs.finding_count }}
+          SEMGREP_SUPPLY_CHAIN_COUNT: ${{ needs.semgrep-scan.outputs.supply_chain_count }}
+          SEMGREP_HAS_FINDINGS: ${{ needs.semgrep-scan.outputs.has_findings }}
         run: |
           set -euo pipefail
 
-          PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
+          PROVIDER="${INPUT_PROVIDER}"
           RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
           SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
 
-          echo "Semgrep findings from previous job: ${{ needs.semgrep-scan.outputs.finding_count }}"
-          echo "Supply Chain findings: ${{ needs.semgrep-scan.outputs.supply_chain_count }}"
-          echo "Has findings: ${{ needs.semgrep-scan.outputs.has_findings }}"
+          echo "Semgrep findings from previous job: ${SEMGREP_FINDING_COUNT}"
+          echo "Supply Chain findings: ${SEMGREP_SUPPLY_CHAIN_COUNT}"
+          echo "Has findings: ${SEMGREP_HAS_FINDINGS}"
 
           set +o pipefail
           python github-actions/scripts/analyze_semgrep_findings.py \
             --semgrep-results "${RESULTS_JSON}" \
             --java-app-dir "${JAVA_APP_DIR}" \
             --provider "${PROVIDER}" \
+            --apply-fixes \
             --output-summary "${SUMMARY_JSON}" \
             | tee "${RUNNER_TEMP}/analysis.log"
           SCRIPT_EXIT=${PIPESTATUS[0]}
           set -o pipefail
 
           if [ -f "${SUMMARY_JSON}" ]; then
+            CHANGED=$(python -c "import json; print('true' if json.load(open('${SUMMARY_JSON}')).get('changed') else 'false')")
+            echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+
             python -c "
           import json, pathlib
           data = json.loads(pathlib.Path('${SUMMARY_JSON}').read_text())
@@ -230,15 +247,48 @@ jobs:
               sca = data.get('supply_chain_count')
               if sca is not None:
                   f.write(f\" (Supply Chain: **{sca}**)\")
-              f.write('\n\n')
+              f.write('\n')
+              fixes = data.get('fixes_applied') or []
+              if fixes:
+                  f.write(f\"- Automated fixes applied: **{len(fixes)}**\n\n\")
+                  for fix in fixes:
+                      f.write(f\"  - \`{fix.get('file')}\`: {fix.get('detail')}\n\")
+                  f.write('\n')
               if analysis:
                   f.write(analysis)
               elif data.get('error'):
                   f.write(f\"Analysis failed: {data['error']}\")
             "
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
           exit "${SCRIPT_EXIT}"
+
+      - name: Create pull request
+        if: >-
+          steps.analyze.outputs.changed == 'true' &&
+          (github.event_name != 'workflow_dispatch' || inputs.create_pr == true)
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "fix(security): apply Semgrep remediation fixes"
+          title: "fix(security): Semgrep findings remediation"
+          body: |
+            ## Summary
+            - Automated fixes from Semgrep Code and Supply Chain findings.
+            - AI analysis and fix plan: see workflow run logs (`analysis-summary.json`).
+            - Triggered by: `${{ github.event_name }}` on `${{ github.ref_name }}`.
+
+            ## Test plan
+            - [ ] Review dependency version bumps and workflow hardening changes
+            - [ ] Re-run Semgrep Security Scan workflow
+            - [ ] Run `mvn test` in `java-app`
+          branch: semgrep/security-fixes-${{ github.run_id }}
+          delete-branch: true
+          labels: |
+            security
+            automated
 
       - name: Analysis summary
         if: always()

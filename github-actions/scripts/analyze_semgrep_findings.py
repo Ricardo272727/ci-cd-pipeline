@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -169,6 +170,263 @@ def format_findings_text(data: dict) -> str:
         )
 
     return "\n".join(lines).rstrip()
+
+
+LOG4J_CORE_PATTERN = re.compile(
+    r"(<groupId>org\.apache\.logging\.log4j</groupId>\s*"
+    r"<artifactId>log4j-core</artifactId>\s*"
+    r"<version>)([^<]+)(</version>)",
+    re.MULTILINE,
+)
+DEMO_LOG4J_COMMENT = re.compile(
+    r"\s*<!-- Intentionally vulnerable for Semgrep demo.*?-->\s*",
+    re.DOTALL,
+)
+GENERATE_UNIT_TESTS_OLD = """        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+        run: |
+          set -euo pipefail
+
+          FORCE_FLAG=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+
+          PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
+"""
+GENERATE_UNIT_TESTS_NEW = """        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_FORCE: ${{ inputs.force }}
+          INPUT_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}
+        run: |
+          set -euo pipefail
+
+          FORCE_FLAG=""
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${INPUT_FORCE}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+
+          PROVIDER="${INPUT_PROVIDER}"
+"""
+SEMGREP_ANALYZE_OLD = """        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+        run: |
+          set -euo pipefail
+
+          PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
+          RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
+          SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
+
+          echo "Semgrep findings from previous job: ${{ needs.semgrep-scan.outputs.finding_count }}"
+          echo "Supply Chain findings: ${{ needs.semgrep-scan.outputs.supply_chain_count }}"
+          echo "Has findings: ${{ needs.semgrep-scan.outputs.has_findings }}"
+
+          set +o pipefail
+          python github-actions/scripts/analyze_semgrep_findings.py \\
+            --semgrep-results "${RESULTS_JSON}" \\
+            --java-app-dir "${JAVA_APP_DIR}" \\
+            --provider "${PROVIDER}" \\
+            --output-summary "${SUMMARY_JSON}" \\
+            | tee "${RUNNER_TEMP}/analysis.log"
+"""
+SEMGREP_ANALYZE_NEW = """        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          INPUT_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}
+          SEMGREP_FINDING_COUNT: ${{ needs.semgrep-scan.outputs.finding_count }}
+          SEMGREP_SUPPLY_CHAIN_COUNT: ${{ needs.semgrep-scan.outputs.supply_chain_count }}
+          SEMGREP_HAS_FINDINGS: ${{ needs.semgrep-scan.outputs.has_findings }}
+        run: |
+          set -euo pipefail
+
+          PROVIDER="${INPUT_PROVIDER}"
+          RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
+          SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
+
+          echo "Semgrep findings from previous job: ${SEMGREP_FINDING_COUNT}"
+          echo "Supply Chain findings: ${SEMGREP_SUPPLY_CHAIN_COUNT}"
+          echo "Has findings: ${SEMGREP_HAS_FINDINGS}"
+
+          set +o pipefail
+          python github-actions/scripts/analyze_semgrep_findings.py \\
+            --semgrep-results "${RESULTS_JSON}" \\
+            --java-app-dir "${JAVA_APP_DIR}" \\
+            --provider "${PROVIDER}" \\
+            --apply-fixes \\
+            --output-summary "${SUMMARY_JSON}" \\
+            | tee "${RUNNER_TEMP}/analysis.log"
+"""
+
+
+def _pick_log4j_fix_version(findings: list[dict]) -> str:
+    for finding in findings:
+        if finding.get("package") != "log4j-core":
+            continue
+        fix_versions = finding.get("fix_versions")
+        if isinstance(fix_versions, list) and fix_versions:
+            return str(fix_versions[0])
+        if isinstance(fix_versions, dict):
+            for versions in fix_versions.values():
+                if isinstance(versions, list) and versions:
+                    return str(versions[0])
+    return "2.17.2"
+
+
+def _needs_log4j_fix(findings: list[dict]) -> bool:
+    for finding in findings:
+        if finding.get("type") != "supply_chain":
+            continue
+        if finding.get("package") == "log4j-core":
+            return True
+    return False
+
+
+def _needs_workflow_shell_fix(findings: list[dict], relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/")
+    for finding in findings:
+        if finding.get("type") != "code":
+            continue
+        check_id = str(finding.get("check_id") or "")
+        path = str(finding.get("path") or "").replace("\\", "/")
+        if "run-shell-injection" not in check_id:
+            continue
+        if path == normalized or path.endswith("/" + normalized):
+            return True
+    return False
+
+
+def fix_log4j_in_pom(pom_path: Path, target_version: str, *, dry_run: bool) -> dict | None:
+    if not pom_path.is_file():
+        return None
+    content = pom_path.read_text(encoding="utf-8")
+    if not LOG4J_CORE_PATTERN.search(content):
+        return None
+
+    updated = DEMO_LOG4J_COMMENT.sub("\n", content)
+    updated, count = LOG4J_CORE_PATTERN.subn(
+        rf"\g<1>{target_version}\g<3>",
+        updated,
+        count=1,
+    )
+    if count == 0 or updated == content:
+        return None
+
+    if not dry_run:
+        pom_path.write_text(updated, encoding="utf-8")
+
+    return {
+        "file": str(pom_path),
+        "action": "upgrade_log4j_core",
+        "detail": f"log4j-core -> {target_version}",
+    }
+
+
+def fix_workflow_shell_injection(
+    workflow_path: Path,
+    repo_root: Path,
+    findings: list[dict],
+    *,
+    dry_run: bool,
+) -> list[dict]:
+    try:
+        relative_path = workflow_path.relative_to(repo_root).as_posix()
+    except ValueError:
+        return []
+
+    if workflow_path.name == "generate-unit-tests.yml":
+        if not _needs_workflow_shell_fix(findings, relative_path):
+            return []
+        content = workflow_path.read_text(encoding="utf-8")
+        if GENERATE_UNIT_TESTS_OLD not in content:
+            return []
+        updated = content.replace(GENERATE_UNIT_TESTS_OLD, GENERATE_UNIT_TESTS_NEW, 1)
+        if updated == content:
+            return []
+        if not dry_run:
+            workflow_path.write_text(updated, encoding="utf-8")
+        return [
+            {
+                "file": str(workflow_path),
+                "action": "workflow_shell_injection",
+                "detail": "route GitHub context through env vars in generate step",
+            }
+        ]
+
+    if workflow_path.name == "semgrep-scan.yml":
+        if not _needs_workflow_shell_fix(findings, relative_path):
+            return []
+        content = workflow_path.read_text(encoding="utf-8")
+        if SEMGREP_ANALYZE_OLD not in content:
+            return []
+        updated = content.replace(SEMGREP_ANALYZE_OLD, SEMGREP_ANALYZE_NEW, 1)
+        if updated == content:
+            return []
+        if not dry_run:
+            workflow_path.write_text(updated, encoding="utf-8")
+        return [
+            {
+                "file": str(workflow_path),
+                "action": "workflow_shell_injection",
+                "detail": "route GitHub context through env vars in analyze step",
+            }
+        ]
+
+    return []
+
+
+def apply_deterministic_fixes(
+    data: dict,
+    repo_root: Path,
+    *,
+    java_app_dir: str,
+    dry_run: bool,
+) -> list[dict]:
+    summary = summarize_findings(data, max_findings=10_000)
+    findings = summary["findings"]
+    if not findings:
+        return []
+
+    applied: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    if _needs_log4j_fix(findings):
+        pom_path = repo_root / java_app_dir / "pom.xml"
+        fix_version = _pick_log4j_fix_version(findings)
+        result = fix_log4j_in_pom(pom_path, fix_version, dry_run=dry_run)
+        if result:
+            key = (result["file"], result["action"])
+            if key not in seen:
+                seen.add(key)
+                applied.append(result)
+
+    workflow_dir = repo_root / ".github" / "workflows"
+    for workflow_name in ("generate-unit-tests.yml", "semgrep-scan.yml"):
+        workflow_path = workflow_dir / workflow_name
+        for fix in fix_workflow_shell_injection(
+            workflow_path, repo_root, findings, dry_run=dry_run
+        ):
+            key = (fix["file"], fix["action"])
+            if key not in seen:
+                seen.add(key)
+                applied.append(fix)
+
+    return applied
 
 
 def build_user_prompt(summary: dict, java_app_dir: str) -> str:
@@ -366,6 +624,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Print a human-readable Semgrep summary and exit (no AI analysis)",
     )
     parser.add_argument(
+        "--apply-fixes",
+        action="store_true",
+        help="Apply deterministic fixes for supported Semgrep findings",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --apply-fixes, report planned fixes without writing files",
+    )
+    parser.add_argument(
         "--output-summary",
         help="Write analysis summary JSON to this path",
     )
@@ -383,6 +651,9 @@ async def async_main(argv: list[str]) -> int:
         "finding_count": 0,
         "supply_chain_count": 0,
         "analysis": None,
+        "fixes_applied": [],
+        "files_modified": [],
+        "changed": False,
         "error": None,
     }
 
@@ -398,6 +669,28 @@ async def async_main(argv: list[str]) -> int:
         summary["supply_chain_count"] = compact["by_type"].get("supply_chain", 0)
         summary["by_severity"] = compact["by_severity"]
         summary["by_type"] = compact["by_type"]
+
+        if args.apply_fixes:
+            fixes = apply_deterministic_fixes(
+                raw,
+                repo_root,
+                java_app_dir=args.java_app_dir,
+                dry_run=args.dry_run,
+            )
+            summary["fixes_applied"] = fixes
+            summary["files_modified"] = sorted({fix["file"] for fix in fixes})
+            summary["changed"] = bool(fixes) and not args.dry_run
+            if fixes:
+                label = "Planned fixes" if args.dry_run else "Applied fixes"
+                print(f"\n--- {label} ---\n")
+                for fix in fixes:
+                    print(f"- {fix['file']}: {fix['action']} ({fix['detail']})")
+            else:
+                print("No automatic fixes available for the reported findings.")
+
+        if compact["total_findings"] == 0 and not summary["changed"]:
+            print("No findings to analyze.")
+            return 0
 
         provider = select_provider(args.provider)
         summary["provider"] = provider
