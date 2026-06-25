@@ -187,6 +187,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Semgrep results
         uses: actions/download-artifact@v4
@@ -224,6 +226,7 @@ jobs:
           PROVIDER="${INPUT_PROVIDER}"
           RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
           SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
+          CHANGED="false"
 
           echo "Semgrep findings from previous job: ${SEMGREP_FINDING_COUNT}"
           echo "Supply Chain findings: ${SEMGREP_SUPPLY_CHAIN_COUNT}"
@@ -243,6 +246,7 @@ jobs:
           if [ -f "${SUMMARY_JSON}" ]; then
             CHANGED=$(python -c "import json; print('true' if json.load(open('${SUMMARY_JSON}')).get('changed') else 'false')")
             echo "changed=${CHANGED}" >> "$GITHUB_OUTPUT"
+            echo "PR gate: changed=${CHANGED}"
 
             python -c "
           import json, pathlib
@@ -269,12 +273,19 @@ jobs:
             "
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "PR gate: changed=false (no summary file)"
+          fi
+
+          if [ "${CHANGED:-false}" = "true" ]; then
+            echo "Fixes applied; continuing to PR step even if analysis exited non-zero."
+            exit 0
           fi
 
           exit "${SCRIPT_EXIT}"
 
       - name: Create pull request
         if: >-
+          always() &&
           steps.analyze.outputs.changed == 'true' &&
           (github.event_name != 'workflow_dispatch' || inputs.create_pr == true)
         uses: peter-evans/create-pull-request@v7

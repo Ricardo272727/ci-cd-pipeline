@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -58,6 +59,11 @@ def _finding_in_java_app(item: dict, java_app_dir: str) -> bool:
     if path == prefix or path.startswith(f"{prefix}/"):
         return True
 
+    # semgrep ci --subdir java-app reports paths relative to that folder
+    if path and not path.startswith(".github/") and ".." not in path:
+        if path in {"pom.xml", "maven_dep_tree.txt"} or path.startswith("src/"):
+            return True
+
     extra = item.get("extra") or {}
     sca_info = extra.get("sca_info") or {}
     if not sca_info:
@@ -68,10 +74,10 @@ def _finding_in_java_app(item: dict, java_app_dir: str) -> bool:
     if lockfile == prefix or lockfile.startswith(f"{prefix}/"):
         return True
 
-    # Supply-chain findings are often reported against maven_dep_tree.txt.
-    return path.endswith("maven_dep_tree.txt") and (
-        not lockfile or lockfile.startswith(f"{prefix}/") or lockfile == "maven_dep_tree.txt"
-    )
+    if lockfile in {"maven_dep_tree.txt", "pom.xml"}:
+        return True
+
+    return path.endswith("maven_dep_tree.txt")
 
 
 def filter_results_for_java_app(data: dict, java_app_dir: str) -> dict:
@@ -244,6 +250,28 @@ def _needs_log4j_fix(findings: list[dict]) -> bool:
     return False
 
 
+def pom_has_vulnerable_log4j(pom_path: Path) -> bool:
+    if not pom_path.is_file():
+        return False
+    content = pom_path.read_text(encoding="utf-8")
+    match = LOG4J_CORE_PATTERN.search(content)
+    if not match:
+        return False
+    version = match.group(2)
+    return version.startswith("2.14.") or version.startswith("2.15.") or version.startswith("2.16.")
+
+
+def java_app_has_uncommitted_changes(repo_root: Path, java_app_dir: str) -> bool:
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--", java_app_dir],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return bool(result.stdout.strip())
+
+
 def fix_log4j_in_pom(pom_path: Path, target_version: str, *, dry_run: bool) -> dict | None:
     if not pom_path.is_file():
         return None
@@ -277,17 +305,23 @@ def apply_deterministic_fixes(
     java_app_dir: str,
     dry_run: bool,
 ) -> list[dict]:
-    scoped = filter_results_for_java_app(data, java_app_dir)
-    summary = summarize_findings(scoped, max_findings=10_000)
-    findings = summary["findings"]
-    if not findings:
-        return []
+    all_findings = summarize_findings(data, max_findings=10_000)["findings"]
+    scoped_findings = summarize_findings(
+        filter_results_for_java_app(data, java_app_dir),
+        max_findings=10_000,
+    )["findings"]
+    findings = all_findings if all_findings else scoped_findings
 
     applied: list[dict] = []
+    pom_path = repo_root / java_app_dir / "pom.xml"
+    should_fix_log4j = (
+        _needs_log4j_fix(all_findings)
+        or _needs_log4j_fix(scoped_findings)
+        or pom_has_vulnerable_log4j(pom_path)
+    )
 
-    if _needs_log4j_fix(findings):
-        pom_path = repo_root / java_app_dir / "pom.xml"
-        fix_version = _pick_log4j_fix_version(findings)
+    if should_fix_log4j:
+        fix_version = _pick_log4j_fix_version(findings or scoped_findings or all_findings)
         result = fix_log4j_in_pom(pom_path, fix_version, dry_run=dry_run)
         if result:
             applied.append(result)
@@ -569,12 +603,19 @@ async def async_main(argv: list[str]) -> int:
             )
             summary["fixes_applied"] = fixes
             summary["files_modified"] = sorted({fix["file"] for fix in fixes})
-            summary["changed"] = bool(fixes) and not args.dry_run
+            if args.dry_run:
+                summary["changed"] = bool(fixes)
+            else:
+                summary["changed"] = bool(fixes) or java_app_has_uncommitted_changes(
+                    repo_root, args.java_app_dir
+                )
             if fixes:
                 label = "Planned fixes" if args.dry_run else "Applied fixes"
                 print(f"\n--- {label} ---\n")
                 for fix in fixes:
                     print(f"- {fix['file']}: {fix['action']} ({fix['detail']})")
+            elif summary["changed"]:
+                print("Detected uncommitted changes under java-app.")
             else:
                 print("No automatic fixes available for the reported findings.")
 
@@ -593,24 +634,30 @@ async def async_main(argv: list[str]) -> int:
             )
 
         prompt = build_user_prompt(compact, args.java_app_dir)
-        analysis = await request_analysis(
-            prompt,
-            provider=provider,
-            repo_root=repo_root,
-            copilot_model=os.environ.get("COPILOT_MODEL", "").strip() or None,
-            openai_model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
-            openai_base_url=os.environ.get("OPENAI_BASE_URL"),
-            timeout_seconds=args.timeout,
-        )
-        summary["analysis"] = analysis
-        print("\n--- Copilot security analysis ---\n")
-        print(analysis)
+        try:
+            analysis = await request_analysis(
+                prompt,
+                provider=provider,
+                repo_root=repo_root,
+                copilot_model=os.environ.get("COPILOT_MODEL", "").strip() or None,
+                openai_model=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"),
+                openai_base_url=os.environ.get("OPENAI_BASE_URL"),
+                timeout_seconds=args.timeout,
+            )
+            summary["analysis"] = analysis
+            print("\n--- Copilot security analysis ---\n")
+            print(analysis)
+        except Exception as analysis_exc:
+            summary["analysis_error"] = str(analysis_exc)
+            print(f"warning: AI analysis failed: {analysis_exc}", file=sys.stderr)
+            if not summary["changed"]:
+                raise
     except Exception as exc:
         summary["error"] = str(exc)
         print(f"error: {exc}", file=sys.stderr)
         if summary_path:
             summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        return 1
+        return 0 if summary.get("changed") else 1
     finally:
         if summary_path:
             summary_path.parent.mkdir(parents=True, exist_ok=True)
