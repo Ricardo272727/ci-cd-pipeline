@@ -1,5 +1,6 @@
 # Maven / Java
 java-app/target/
+java-app/maven_dep_tree.txt
 *.class
 *.jar
 *.war

@@ -1,0 +1,250 @@
+# Semgrep AppSec Platform scan (code + Supply Chain) for java-app, then AI review
+# of findings via GitHub Copilot SDK (preferred) or OpenAI fallback.
+#
+# Required secret:
+#   SEMGREP_APP_TOKEN  → Semgrep AppSec Platform token (Settings → Access Tokens)
+#                        Enable Supply Chain for the project in Semgrep Cloud.
+#
+# Copilot analysis auth (pick one):
+#   - permissions.copilot-requests: write  → uses GITHUB_TOKEN (org Copilot billing)
+#   - secrets.COPILOT_GITHUB_TOKEN         → fine-grained PAT with Copilot Requests
+#
+# OpenAI fallback: set secrets.OPENAI_API_KEY and workflow input provider=openai
+name: Semgrep Security Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: AI provider for findings analysis (auto, copilot, or openai)
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - copilot
+          - openai
+  push:
+    branches: [main]
+    paths:
+      - "java-app/**"
+      - "github-actions/scripts/analyze_semgrep_findings.py"
+      - ".github/workflows/semgrep-scan.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "java-app/**"
+
+env:
+  JAVA_APP_DIR: java-app
+  PYTHON_VERSION: "3.12"
+  JAVA_VERSION: "17"
+
+concurrency:
+  group: semgrep-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  copilot-requests: write
+
+jobs:
+  semgrep-scan:
+    name: Semgrep Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      finding_count: ${{ steps.scan.outputs.finding_count }}
+      has_findings: ${{ steps.scan.outputs.has_findings }}
+      supply_chain_count: ${{ steps.scan.outputs.supply_chain_count }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify Semgrep token
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          if [ -z "${SEMGREP_APP_TOKEN}" ]; then
+            echo "error: SEMGREP_APP_TOKEN repository secret is required"
+            exit 1
+          fi
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Generate Maven dependency tree
+        working-directory: ${{ env.JAVA_APP_DIR }}
+        run: mvn -B dependency:tree -DoutputFile=maven_dep_tree.txt -Dmaven.test.skip=true
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep CI (code + Supply Chain)
+        id: scan
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          RESULTS_JSON="${RUNNER_TEMP}/semgrep-results.json"
+          RESULTS_TXT="${RUNNER_TEMP}/semgrep-results.txt"
+
+          echo "Maven dependency tree:"
+          head -n 40 "${JAVA_APP_DIR}/maven_dep_tree.txt" || true
+          echo ""
+
+          # semgrep ci uses policies from Semgrep AppSec Platform (not local rulesets).
+          # Exit code 0 = no findings, 1 = findings, 2+ = scan error.
+          set +e
+          semgrep ci \
+            --json \
+            --json-output="${RESULTS_JSON}" \
+            2>&1 | tee "${RUNNER_TEMP}/semgrep-ci.log"
+          SEMGREP_EXIT=$?
+          set -e
+
+          if [ ! -f "${RESULTS_JSON}" ]; then
+            echo "error: Semgrep did not produce JSON output (exit ${SEMGREP_EXIT})"
+            exit 1
+          fi
+
+          python github-actions/scripts/analyze_semgrep_findings.py \
+            --semgrep-results "${RESULTS_JSON}" \
+            --print-findings \
+            | tee "${RESULTS_TXT}"
+
+          read -r FINDING_COUNT SUPPLY_CHAIN_COUNT CODE_COUNT <<< "$(python -c "
+          import json
+          data = json.load(open('${RESULTS_JSON}'))
+          results = data.get('results') or []
+          sca = sum(1 for r in results if (r.get('extra') or {}).get('sca_info'))
+          print(len(results), sca, len(results) - sca)
+          ")"
+
+          HAS_FINDINGS=$([ "${FINDING_COUNT}" -gt 0 ] && echo true || echo false)
+
+          echo "finding_count=${FINDING_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "has_findings=${HAS_FINDINGS}" >> "$GITHUB_OUTPUT"
+          echo "supply_chain_count=${SUPPLY_CHAIN_COUNT}" >> "$GITHUB_OUTPUT"
+
+          echo "## Semgrep scan summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Target: \`${JAVA_APP_DIR}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Total findings: **${FINDING_COUNT}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Supply Chain (dependency) findings: **${SUPPLY_CHAIN_COUNT}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Code findings: **${CODE_COUNT}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Semgrep exit code: ${SEMGREP_EXIT}" >> "$GITHUB_STEP_SUMMARY"
+
+          echo ""
+          echo "========== Semgrep findings (${FINDING_COUNT}) =========="
+          cat "${RESULTS_TXT}"
+          echo "======================================================="
+          echo ""
+
+          if [ "${SEMGREP_EXIT}" -ge 2 ]; then
+            echo "error: Semgrep failed with a scan error"
+            exit "${SEMGREP_EXIT}"
+          fi
+
+      - name: Upload Semgrep results
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: ${{ runner.temp }}/semgrep-results.json
+          retention-days: 7
+
+  copilot-analysis:
+    name: Copilot Security Analysis
+    needs: semgrep-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Semgrep results
+        uses: actions/download-artifact@v4
+        with:
+          name: semgrep-results
+          path: ${{ runner.temp }}/semgrep
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: github-actions/requirements-generate-tests.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r github-actions/requirements-generate-tests.txt
+
+      - name: Analyze findings with Copilot
+        id: analyze
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+        run: |
+          set -euo pipefail
+
+          PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
+          RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
+          SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
+
+          echo "Semgrep findings from previous job: ${{ needs.semgrep-scan.outputs.finding_count }}"
+          echo "Supply Chain findings: ${{ needs.semgrep-scan.outputs.supply_chain_count }}"
+          echo "Has findings: ${{ needs.semgrep-scan.outputs.has_findings }}"
+
+          set +o pipefail
+          python github-actions/scripts/analyze_semgrep_findings.py \
+            --semgrep-results "${RESULTS_JSON}" \
+            --java-app-dir "${JAVA_APP_DIR}" \
+            --provider "${PROVIDER}" \
+            --output-summary "${SUMMARY_JSON}" \
+            | tee "${RUNNER_TEMP}/analysis.log"
+          SCRIPT_EXIT=${PIPESTATUS[0]}
+          set -o pipefail
+
+          if [ -f "${SUMMARY_JSON}" ]; then
+            python -c "
+          import json, pathlib
+          data = json.loads(pathlib.Path('${SUMMARY_JSON}').read_text())
+          analysis = data.get('analysis') or ''
+          with open('${GITHUB_STEP_SUMMARY}', 'a', encoding='utf-8') as f:
+              f.write('\n## Copilot security analysis\n\n')
+              f.write(f\"- Provider: \`{data.get('provider')}\`\n\")
+              f.write(f\"- Findings reviewed: **{data.get('finding_count', 0)}**\")
+              sca = data.get('supply_chain_count')
+              if sca is not None:
+                  f.write(f\" (Supply Chain: **{sca}**)\")
+              f.write('\n\n')
+              if analysis:
+                  f.write(analysis)
+              elif data.get('error'):
+                  f.write(f\"Analysis failed: {data['error']}\")
+            "
+          fi
+
+          exit "${SCRIPT_EXIT}"
+
+      - name: Analysis summary
+        if: always()
+        run: |
+          if [ -f "${RUNNER_TEMP}/analysis-summary.json" ]; then
+            cat "${RUNNER_TEMP}/analysis-summary.json"
+          else
+            echo "No analysis summary produced."
+          fi
