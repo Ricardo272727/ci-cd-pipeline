@@ -17,6 +17,8 @@ The input may include:
 - Code findings (SAST) from Semgrep Code
 - Supply Chain findings (SCA) for vulnerable Maven dependencies, including CVEs, versions, and reachability
 
+The input covers findings scoped to the `java-app` directory only (Java source and Maven dependencies). Ignore repository workflow or CI configuration findings.
+
 Provide a structured security review with these sections:
 
 ## Executive summary
@@ -44,6 +46,41 @@ def load_semgrep_results(path: Path) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"Semgrep results file not found: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _normalize_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def _finding_in_java_app(item: dict, java_app_dir: str) -> bool:
+    prefix = _normalize_path(java_app_dir).rstrip("/")
+    path = _normalize_path(str(item.get("path") or ""))
+    if path == prefix or path.startswith(f"{prefix}/"):
+        return True
+
+    extra = item.get("extra") or {}
+    sca_info = extra.get("sca_info") or {}
+    if not sca_info:
+        return False
+
+    dependency_match = sca_info.get("dependency_match") or {}
+    lockfile = _normalize_path(str(dependency_match.get("lockfile") or ""))
+    if lockfile == prefix or lockfile.startswith(f"{prefix}/"):
+        return True
+
+    # Supply-chain findings are often reported against maven_dep_tree.txt.
+    return path.endswith("maven_dep_tree.txt") and (
+        not lockfile or lockfile.startswith(f"{prefix}/") or lockfile == "maven_dep_tree.txt"
+    )
+
+
+def filter_results_for_java_app(data: dict, java_app_dir: str) -> dict:
+    results = [
+        item
+        for item in (data.get("results") or [])
+        if _finding_in_java_app(item, java_app_dir)
+    ]
+    return {**data, "results": results}
 
 
 def _metadata_cves(metadata: object) -> list[str]:
@@ -182,96 +219,6 @@ DEMO_LOG4J_COMMENT = re.compile(
     r"\s*<!-- Intentionally vulnerable for Semgrep demo.*?-->\s*",
     re.DOTALL,
 )
-GENERATE_UNIT_TESTS_OLD = """        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
-        run: |
-          set -euo pipefail
-
-          FORCE_FLAG=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
-            FORCE_FLAG="--force"
-          fi
-
-          PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
-"""
-GENERATE_UNIT_TESTS_NEW = """        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_FORCE: ${{ inputs.force }}
-          INPUT_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}
-        run: |
-          set -euo pipefail
-
-          FORCE_FLAG=""
-          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ "${INPUT_FORCE}" = "true" ]; then
-            FORCE_FLAG="--force"
-          fi
-
-          PROVIDER="${INPUT_PROVIDER}"
-"""
-SEMGREP_ANALYZE_OLD = """        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
-        run: |
-          set -euo pipefail
-
-          PROVIDER="${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}"
-          RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
-          SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
-
-          echo "Semgrep findings from previous job: ${{ needs.semgrep-scan.outputs.finding_count }}"
-          echo "Supply Chain findings: ${{ needs.semgrep-scan.outputs.supply_chain_count }}"
-          echo "Has findings: ${{ needs.semgrep-scan.outputs.has_findings }}"
-
-          set +o pipefail
-          python github-actions/scripts/analyze_semgrep_findings.py \\
-            --semgrep-results "${RESULTS_JSON}" \\
-            --java-app-dir "${JAVA_APP_DIR}" \\
-            --provider "${PROVIDER}" \\
-            --output-summary "${SUMMARY_JSON}" \\
-            | tee "${RUNNER_TEMP}/analysis.log"
-"""
-SEMGREP_ANALYZE_NEW = """        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          COPILOT_MODEL: ${{ vars.COPILOT_MODEL }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
-          INPUT_PROVIDER: ${{ github.event_name == 'workflow_dispatch' && inputs.provider || 'auto' }}
-          SEMGREP_FINDING_COUNT: ${{ needs.semgrep-scan.outputs.finding_count }}
-          SEMGREP_SUPPLY_CHAIN_COUNT: ${{ needs.semgrep-scan.outputs.supply_chain_count }}
-          SEMGREP_HAS_FINDINGS: ${{ needs.semgrep-scan.outputs.has_findings }}
-        run: |
-          set -euo pipefail
-
-          PROVIDER="${INPUT_PROVIDER}"
-          RESULTS_JSON="${RUNNER_TEMP}/semgrep/semgrep-results.json"
-          SUMMARY_JSON="${RUNNER_TEMP}/analysis-summary.json"
-
-          echo "Semgrep findings from previous job: ${SEMGREP_FINDING_COUNT}"
-          echo "Supply Chain findings: ${SEMGREP_SUPPLY_CHAIN_COUNT}"
-          echo "Has findings: ${SEMGREP_HAS_FINDINGS}"
-
-          set +o pipefail
-          python github-actions/scripts/analyze_semgrep_findings.py \\
-            --semgrep-results "${RESULTS_JSON}" \\
-            --java-app-dir "${JAVA_APP_DIR}" \\
-            --provider "${PROVIDER}" \\
-            --apply-fixes \\
-            --output-summary "${SUMMARY_JSON}" \\
-            | tee "${RUNNER_TEMP}/analysis.log"
-"""
 
 
 def _pick_log4j_fix_version(findings: list[dict]) -> str:
@@ -293,20 +240,6 @@ def _needs_log4j_fix(findings: list[dict]) -> bool:
         if finding.get("type") != "supply_chain":
             continue
         if finding.get("package") == "log4j-core":
-            return True
-    return False
-
-
-def _needs_workflow_shell_fix(findings: list[dict], relative_path: str) -> bool:
-    normalized = relative_path.replace("\\", "/")
-    for finding in findings:
-        if finding.get("type") != "code":
-            continue
-        check_id = str(finding.get("check_id") or "")
-        path = str(finding.get("path") or "").replace("\\", "/")
-        if "run-shell-injection" not in check_id:
-            continue
-        if path == normalized or path.endswith("/" + normalized):
             return True
     return False
 
@@ -337,59 +270,6 @@ def fix_log4j_in_pom(pom_path: Path, target_version: str, *, dry_run: bool) -> d
     }
 
 
-def fix_workflow_shell_injection(
-    workflow_path: Path,
-    repo_root: Path,
-    findings: list[dict],
-    *,
-    dry_run: bool,
-) -> list[dict]:
-    try:
-        relative_path = workflow_path.relative_to(repo_root).as_posix()
-    except ValueError:
-        return []
-
-    if workflow_path.name == "generate-unit-tests.yml":
-        if not _needs_workflow_shell_fix(findings, relative_path):
-            return []
-        content = workflow_path.read_text(encoding="utf-8")
-        if GENERATE_UNIT_TESTS_OLD not in content:
-            return []
-        updated = content.replace(GENERATE_UNIT_TESTS_OLD, GENERATE_UNIT_TESTS_NEW, 1)
-        if updated == content:
-            return []
-        if not dry_run:
-            workflow_path.write_text(updated, encoding="utf-8")
-        return [
-            {
-                "file": str(workflow_path),
-                "action": "workflow_shell_injection",
-                "detail": "route GitHub context through env vars in generate step",
-            }
-        ]
-
-    if workflow_path.name == "semgrep-scan.yml":
-        if not _needs_workflow_shell_fix(findings, relative_path):
-            return []
-        content = workflow_path.read_text(encoding="utf-8")
-        if SEMGREP_ANALYZE_OLD not in content:
-            return []
-        updated = content.replace(SEMGREP_ANALYZE_OLD, SEMGREP_ANALYZE_NEW, 1)
-        if updated == content:
-            return []
-        if not dry_run:
-            workflow_path.write_text(updated, encoding="utf-8")
-        return [
-            {
-                "file": str(workflow_path),
-                "action": "workflow_shell_injection",
-                "detail": "route GitHub context through env vars in analyze step",
-            }
-        ]
-
-    return []
-
-
 def apply_deterministic_fixes(
     data: dict,
     repo_root: Path,
@@ -397,34 +277,20 @@ def apply_deterministic_fixes(
     java_app_dir: str,
     dry_run: bool,
 ) -> list[dict]:
-    summary = summarize_findings(data, max_findings=10_000)
+    scoped = filter_results_for_java_app(data, java_app_dir)
+    summary = summarize_findings(scoped, max_findings=10_000)
     findings = summary["findings"]
     if not findings:
         return []
 
     applied: list[dict] = []
-    seen: set[tuple[str, str]] = set()
 
     if _needs_log4j_fix(findings):
         pom_path = repo_root / java_app_dir / "pom.xml"
         fix_version = _pick_log4j_fix_version(findings)
         result = fix_log4j_in_pom(pom_path, fix_version, dry_run=dry_run)
         if result:
-            key = (result["file"], result["action"])
-            if key not in seen:
-                seen.add(key)
-                applied.append(result)
-
-    workflow_dir = repo_root / ".github" / "workflows"
-    for workflow_name in ("generate-unit-tests.yml", "semgrep-scan.yml"):
-        workflow_path = workflow_dir / workflow_name
-        for fix in fix_workflow_shell_injection(
-            workflow_path, repo_root, findings, dry_run=dry_run
-        ):
-            key = (fix["file"], fix["action"])
-            if key not in seen:
-                seen.add(key)
-                applied.append(fix)
+            applied.append(result)
 
     return applied
 
@@ -432,8 +298,8 @@ def apply_deterministic_fixes(
 def build_user_prompt(summary: dict, java_app_dir: str) -> str:
     payload = json.dumps(summary, indent=2)
     return (
-        f"Semgrep scanned the `{java_app_dir}` Java application "
-        f"(Semgrep Code + Supply Chain via `semgrep ci`).\n\n"
+        f"Semgrep scanned only the `{java_app_dir}` directory "
+        f"(Semgrep Code + Supply Chain via `semgrep ci --subdir {java_app_dir}`).\n\n"
         f"Findings JSON (compact):\n{payload}\n\n"
         "Analyze these results for the development team."
     )
@@ -624,9 +490,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Print a human-readable Semgrep summary and exit (no AI analysis)",
     )
     parser.add_argument(
+        "--filter-results",
+        action="store_true",
+        help="Keep only findings under --java-app-dir and write scoped JSON",
+    )
+    parser.add_argument(
+        "--output-results",
+        help="Destination for --filter-results (default: overwrite --semgrep-results)",
+    )
+    parser.add_argument(
         "--apply-fixes",
         action="store_true",
-        help="Apply deterministic fixes for supported Semgrep findings",
+        help="Apply deterministic fixes under --java-app-dir only (e.g. pom.xml)",
     )
     parser.add_argument(
         "--dry-run",
@@ -659,6 +534,21 @@ async def async_main(argv: list[str]) -> int:
 
     try:
         raw = load_semgrep_results(results_path)
+
+        if args.filter_results:
+            filtered = filter_results_for_java_app(raw, args.java_app_dir)
+            output_path = (
+                Path(args.output_results).resolve()
+                if args.output_results
+                else results_path
+            )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(filtered, indent=2), encoding="utf-8")
+            count = len(filtered.get("results") or [])
+            print(f"Scoped findings to {args.java_app_dir}: {count} result(s)")
+            return 0
+
+        raw = filter_results_for_java_app(raw, args.java_app_dir)
 
         if args.print_findings:
             print(format_findings_text(raw))

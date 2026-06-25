@@ -107,9 +107,11 @@ jobs:
           echo ""
 
           # semgrep ci uses policies from Semgrep AppSec Platform (not local rulesets).
+          # --subdir limits Code scans to java-app; Supply Chain uses java-app/maven_dep_tree.txt.
           # Exit code 0 = no findings, 1 = findings, 2+ = scan error.
           set +e
           semgrep ci \
+            --subdir "${JAVA_APP_DIR}" \
             --json \
             --json-output="${RESULTS_JSON}" \
             2>&1 | tee "${RUNNER_TEMP}/semgrep-ci.log"
@@ -123,6 +125,12 @@ jobs:
 
           python github-actions/scripts/analyze_semgrep_findings.py \
             --semgrep-results "${RESULTS_JSON}" \
+            --java-app-dir "${JAVA_APP_DIR}" \
+            --filter-results
+
+          python github-actions/scripts/analyze_semgrep_findings.py \
+            --semgrep-results "${RESULTS_JSON}" \
+            --java-app-dir "${JAVA_APP_DIR}" \
             --print-findings \
             | tee "${RESULTS_TXT}"
 
@@ -142,7 +150,7 @@ jobs:
 
           echo "## Semgrep scan summary" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Target: \`${JAVA_APP_DIR}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scan scope: \`${JAVA_APP_DIR}/\` only (\`semgrep ci --subdir ${JAVA_APP_DIR}\`)" >> "$GITHUB_STEP_SUMMARY"
           echo "- Total findings: **${FINDING_COUNT}**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Supply Chain (dependency) findings: **${SUPPLY_CHAIN_COUNT}**" >> "$GITHUB_STEP_SUMMARY"
           echo "- Code findings: **${CODE_COUNT}**" >> "$GITHUB_STEP_SUMMARY"
@@ -276,16 +284,18 @@ jobs:
           title: "fix(security): Semgrep findings remediation"
           body: |
             ## Summary
-            - Automated fixes from Semgrep Code and Supply Chain findings.
+            - Automated fixes for Semgrep findings under `java-app` only.
             - AI analysis and fix plan: see workflow run logs (`analysis-summary.json`).
             - Triggered by: `${{ github.event_name }}` on `${{ github.ref_name }}`.
 
             ## Test plan
-            - [ ] Review dependency version bumps and workflow hardening changes
+            - [ ] Review dependency version bumps in `java-app/pom.xml`
             - [ ] Re-run Semgrep Security Scan workflow
             - [ ] Run `mvn test` in `java-app`
           branch: semgrep/security-fixes-${{ github.run_id }}
           delete-branch: true
+          add-paths: |
+            java-app
           labels: |
             security
             automated
