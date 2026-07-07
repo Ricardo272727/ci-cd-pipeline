@@ -1,6 +1,10 @@
 # Requests GitHub Copilot Code Review on pull requests opened by automation agents
 # (label: automated, or branches copilot/* / semgrep/*).
 #
+# Manual run (workflow_dispatch):
+#   - pr_number: target pull request
+#   - skip_coverage: report JaCoCo but do not fail the job below 80%
+#
 # Runs local quality gates first (tests + JaCoCo coverage) and posts a summary comment
 # so Copilot has measurable context before reviewing.
 #
@@ -17,6 +21,17 @@ on:
   pull_request:
     types: [opened, ready_for_review, synchronize, labeled, reopened]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+      skip_coverage:
+        description: Report coverage but do not fail when below 80%
+        required: false
+        default: false
+        type: boolean
 
 env:
   JAVA_APP_DIR: java-app
@@ -24,7 +39,7 @@ env:
   COPILOT_REVIEWER: copilot-pull-request-reviewer[bot]
 
 concurrency:
-  group: agent-pr-review-${{ github.event.pull_request.number }}
+  group: agent-pr-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 permissions:
@@ -33,25 +48,86 @@ permissions:
   checks: read
 
 jobs:
+  resolve-pr:
+    name: Resolve pull request context
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_run: ${{ steps.resolve.outputs.should_run }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      head_ref: ${{ steps.resolve.outputs.head_ref }}
+      skip_coverage: ${{ steps.resolve.outputs.skip_coverage }}
+
+    steps:
+      - name: Resolve target pull request
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isManual = context.eventName === 'workflow_dispatch';
+            let pr;
+
+            if (isManual) {
+              const prNumber = Number(context.payload.inputs.pr_number);
+              if (!Number.isInteger(prNumber) || prNumber <= 0) {
+                core.setFailed('pr_number must be a positive integer');
+                return;
+              }
+
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              pr = data;
+            } else {
+              pr = context.payload.pull_request;
+            }
+
+            const labels = (pr.labels || []).map((label) => label.name);
+            const isAgentPr =
+              labels.includes('automated') ||
+              pr.head.ref.startsWith('copilot/') ||
+              pr.head.ref.startsWith('semgrep/') ||
+              pr.user?.login === 'github-actions[bot]';
+
+            const shouldRun = isManual || isAgentPr;
+            const skipCoverage =
+              isManual &&
+              (context.payload.inputs.skip_coverage === true ||
+                context.payload.inputs.skip_coverage === 'true');
+
+            core.setOutput('should_run', shouldRun ? 'true' : 'false');
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('head_sha', pr.head.sha);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('skip_coverage', skipCoverage ? 'true' : 'false');
+
+            if (!shouldRun) {
+              core.info('Skipping: pull request does not match agent PR criteria.');
+            }
+            if (skipCoverage) {
+              core.warning('Coverage gate is disabled for this manual run.');
+            }
+
   quality-gates:
     name: Agent PR Quality Gates
+    needs: resolve-pr
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    if: >-
-      contains(github.event.pull_request.labels.*.name, 'automated') ||
-      startsWith(github.head_ref, 'copilot/') ||
-      startsWith(github.head_ref, 'semgrep/') ||
-      github.event.pull_request.user.login == 'github-actions[bot]'
+    if: needs.resolve-pr.outputs.should_run == 'true'
     outputs:
       coverage_percent: ${{ steps.coverage.outputs.coverage_percent }}
       coverage_pass: ${{ steps.coverage.outputs.coverage_pass }}
+      coverage_skipped: ${{ steps.coverage.outputs.coverage_skipped }}
       tests_pass: ${{ steps.coverage.outputs.tests_pass }}
 
     steps:
       - name: Checkout pull request head
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.resolve-pr.outputs.head_sha }}
           fetch-depth: 0
 
       - name: Set up JDK 17
@@ -67,6 +143,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "tests_pass=false" >> "$GITHUB_OUTPUT"
+          echo "coverage_skipped=${SKIP_COVERAGE_GATE}" >> "$GITHUB_OUTPUT"
 
           mvn -B org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test \
             org.jacoco:jacoco-maven-plugin:0.8.12:report \
@@ -82,6 +159,7 @@ jobs:
 
           report = Path("target/site/jacoco/jacoco.xml")
           min_cov = float(os.environ["MIN_COVERAGE_PERCENT"])
+          skip_gate = os.environ.get("SKIP_COVERAGE_GATE", "false").lower() == "true"
           github_output = os.environ["GITHUB_OUTPUT"]
 
           if not report.is_file():
@@ -108,19 +186,31 @@ jobs:
               out.write(f"lines_missed={missed}\n")
 
           print(f"Line coverage: {percent:.2f}% ({covered}/{total} lines)")
+
           if not passed:
-              print(f"Coverage below minimum {min_cov}%", file=sys.stderr)
-              sys.exit(1)
+              if skip_gate:
+                  print(
+                      f"Coverage below minimum {min_cov}% — gate skipped for this run.",
+                      file=sys.stderr,
+                  )
+              else:
+                  print(f"Coverage below minimum {min_cov}%", file=sys.stderr)
+                  sys.exit(1)
           PY
         env:
           MIN_COVERAGE_PERCENT: ${{ env.MIN_COVERAGE_PERCENT }}
+          SKIP_COVERAGE_GATE: ${{ needs.resolve-pr.outputs.skip_coverage }}
 
       - name: Post quality gate summary on pull request
         if: always()
         uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.resolve-pr.outputs.pr_number }}
+          SKIP_COVERAGE: ${{ needs.resolve-pr.outputs.skip_coverage }}
         with:
           script: |
-            const pr = context.payload.pull_request;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const skipCoverage = process.env.SKIP_COVERAGE === 'true';
             const testsPass = '${{ steps.coverage.outputs.tests_pass }}' === 'true';
             const coveragePass = '${{ steps.coverage.outputs.coverage_pass }}' === 'true';
             const coveragePercent = '${{ steps.coverage.outputs.coverage_percent }}' || 'n/a';
@@ -128,15 +218,24 @@ jobs:
             const linesMissed = '${{ steps.coverage.outputs.lines_missed }}' || 'n/a';
             const minCoverage = '${{ env.MIN_COVERAGE_PERCENT }}';
 
+            const coverageResult = skipCoverage
+              ? 'SKIP'
+              : (coveragePass ? 'PASS' : 'FAIL');
+            const coverageDetails = skipCoverage
+              ? `**${coveragePercent}%** (min **${minCoverage}%**) — gate skipped manually — ${linesCovered} covered / ${linesMissed} missed`
+              : `**${coveragePercent}%** (min **${minCoverage}%**) — ${linesCovered} covered / ${linesMissed} missed`;
+
             const body = [
               '## Agent PR quality gates',
               '',
               'Automated checks ran before requesting **Copilot Code Review**.',
-              '',
+              skipCoverage ? '',
+              skipCoverage ? '> Coverage gate was **skipped** for this workflow run (`skip_coverage=true`).' : '',
+              skipCoverage ? '' : null,
               '| Gate | Result | Details |',
               '|------|--------|---------|',
               `| Unit tests (\`mvn test\`) | ${testsPass ? 'PASS' : 'FAIL'} | Spring Boot / JUnit 5 in \`java-app\` |`,
-              `| Line coverage (JaCoCo) | ${coveragePass ? 'PASS' : 'FAIL'} | **${coveragePercent}%** (min **${minCoverage}%**) — ${linesCovered} covered / ${linesMissed} missed |`,
+              `| Line coverage (JaCoCo) | ${coverageResult} | ${coverageDetails} |`,
               '',
               '### Review focus for Copilot',
               '',
@@ -149,13 +248,13 @@ jobs:
               'See `.github/copilot-instructions.md` and `.github/skills/code-review/SKILL.md` for full criteria.',
               '',
               `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            ].join('\n');
+            ].filter((line) => line !== null).join('\n');
 
             const marker = '<!-- agent-pr-quality-gates -->';
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: pr.number,
+              issue_number: prNumber,
               per_page: 100,
             });
 
@@ -174,33 +273,31 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: pr.number,
+                issue_number: prNumber,
                 body: `${marker}\n${body}`,
               });
             }
 
   request-copilot-review:
     name: Request Copilot Code Review
-    needs: quality-gates
+    needs: [resolve-pr, quality-gates]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: >-
       always() &&
-      needs.quality-gates.result != 'cancelled' &&
-      (
-        contains(github.event.pull_request.labels.*.name, 'automated') ||
-        startsWith(github.head_ref, 'copilot/') ||
-        startsWith(github.head_ref, 'semgrep/') ||
-        github.event.pull_request.user.login == 'github-actions[bot]'
-      )
+      needs.resolve-pr.outputs.should_run == 'true' &&
+      needs.quality-gates.result != 'cancelled'
 
     steps:
       - name: Request Copilot as pull request reviewer
         uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.resolve-pr.outputs.pr_number }}
+          COPILOT_REVIEWER: ${{ env.COPILOT_REVIEWER }}
         with:
           script: |
             const reviewer = process.env.COPILOT_REVIEWER;
-            const prNumber = context.payload.pull_request.number;
+            const prNumber = Number(process.env.PR_NUMBER);
 
             try {
               await github.rest.pulls.requestReviewers({
@@ -225,8 +322,6 @@ jobs:
                 throw error;
               }
             }
-        env:
-          COPILOT_REVIEWER: ${{ env.COPILOT_REVIEWER }}
 
       - name: Review request summary
         if: always()
@@ -234,10 +329,14 @@ jobs:
           {
             echo "## Copilot review requested"
             echo ""
-            echo "- Pull request: #${{ github.event.pull_request.number }}"
+            echo "- Pull request: #${{ needs.resolve-pr.outputs.pr_number }}"
+            echo "- Branch: \`${{ needs.resolve-pr.outputs.head_ref }}\`"
             echo "- Reviewer: \`${{ env.COPILOT_REVIEWER }}\`"
             echo "- Quality gates: **${{ needs.quality-gates.result }}**"
             echo "- Coverage: **${{ needs.quality-gates.outputs.coverage_percent }}%** (min ${{ env.MIN_COVERAGE_PERCENT }}%)"
+            if [ "${{ needs.resolve-pr.outputs.skip_coverage }}" = "true" ]; then
+              echo "- Coverage gate: **skipped** (manual run)"
+            fi
             echo ""
             echo "Copilot will post review comments on the pull request timeline."
           } >> "$GITHUB_STEP_SUMMARY"
