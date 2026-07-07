@@ -225,13 +225,20 @@ jobs:
               ? `**${coveragePercent}%** (min **${minCoverage}%**) — gate skipped manually — ${linesCovered} covered / ${linesMissed} missed`
               : `**${coveragePercent}%** (min **${minCoverage}%**) — ${linesCovered} covered / ${linesMissed} missed`;
 
-            const body = [
+            const bodyLines = [
               '## Agent PR quality gates',
               '',
               'Automated checks ran before requesting **Copilot Code Review**.',
-              skipCoverage ? '',
-              skipCoverage ? '> Coverage gate was **skipped** for this workflow run (`skip_coverage=true`).' : '',
-              skipCoverage ? '' : null,
+            ];
+
+            if (skipCoverage) {
+              bodyLines.push(
+                '',
+                '> Coverage gate was **skipped** for this workflow run (`skip_coverage=true`).',
+              );
+            }
+
+            bodyLines.push(
               '| Gate | Result | Details |',
               '|------|--------|---------|',
               `| Unit tests (\`mvn test\`) | ${testsPass ? 'PASS' : 'FAIL'} | Spring Boot / JUnit 5 in \`java-app\` |`,
@@ -248,7 +255,9 @@ jobs:
               'See `.github/copilot-instructions.md` and `.github/skills/code-review/SKILL.md` for full criteria.',
               '',
               `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            ].filter((line) => line !== null).join('\n');
+            );
+
+            const body = bodyLines.join('\n');
 
             const marker = '<!-- agent-pr-quality-gates -->';
             const { data: comments } = await github.rest.issues.listComments({
